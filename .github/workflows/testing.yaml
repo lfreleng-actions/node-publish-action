@@ -1,6 +1,6 @@
 ---
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: 2025 The Linux Foundation
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
 
 # Action test/validation workflow
 name: "Test GitHub Action 🧪"
@@ -20,26 +20,45 @@ concurrency:
 permissions: {}
 
 jobs:
-  ### Test the GitHub Action in this Repository ###
-  tests:
-    name: "Test local GitHub Action"
+  ### Test dry-run publishing against both fixtures ###
+  # CI has no registry credentials, so every test runs in dry-run
+  # mode; real publishes exercise the same stamp/publish/verify path
+  # with the credential steps enabled
+  test-dry-run:
+    name: "Test: ${{ matrix.name }}"
     runs-on: ubuntu-latest
     permissions:
       contents: read
-    timeout-minutes: 10 # Increase this timeout value as needed
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: "Node fixture (test-node-project)"
+            repository: "lfreleng-actions/test-node-project"
+            ref: "89cc7f156c88afa1855087b00ac0dce886e7b0f3"
+            publish_version: "9.9.9"
+            expected_name: "test-node-project"
+            expected_tarball: "test-node-project-9.9.9.tgz"
+          - name: "Real fixture (onap/sdc-onap-ui-common)"
+            repository: "onap/sdc-onap-ui-common"
+            ref: "c305ee4240e368dd0b2238a4f39881a97bad6746"
+            publish_version: "1.0.99-SNAPSHOT"
+            expected_name: "onap-ui-common"
+            expected_tarball: "onap-ui-common-1.0.99-SNAPSHOT.tgz"
     steps:
       # Load the egress allow-list out-of-band from the
       # organisation's .github repository and publish it as
       # $CONNECTION_ALLOW_LIST for the harden-runner step below.
       # yamllint disable-line rule:line-length
-      - uses: lfreleng-actions/harden-runner-block-action@6db537b3e6d060c3287c5a3ce2c28b55b0af330d  # v0.2.1
+      - uses: lfreleng-actions/harden-runner-block-action@6db537b3e6d060c3287c5a3ce2c28b55b0af330d # v0.2.1
         with:
-          config: '@18d9c4446bea555d0783e850f6d295f844fe8f67'  # v0.1.1
+          config: '@807a544b7e55a9224b2b3780e636467bd4b5b99b' # v0.5.0
 
       # Harden the runner with the just-loaded allow-list.
-      - name: 'Harden runner (block)'
+      - name: "Harden runner (block)"
         # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411  # v2.19.4
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
         with:
           egress-policy: 'block'
           allowed-endpoints: >
@@ -50,41 +69,231 @@ jobs:
         with:
           persist-credentials: false
 
-      # Perform setup prior to running test(s)
-      - name: "Testing setup step"
-        shell: bash
-        run: |
-          # Testing setup step
-          echo "Testing setup step"
-          echo "Testing setup step/summary output" >> "$GITHUB_STEP_SUMMARY"
+      # The real fixture has no engines field and no .nvmrc, so the
+      # matrix passes an explicit Node.js version for both fixtures
+      - name: "Checkout test project: ${{ matrix.repository }}"
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: ${{ matrix.repository }}
+          ref: ${{ matrix.ref }}
+          path: test-project
+          persist-credentials: false
 
-      - name: "Running local action: ${{ github.repository }}"
+      - name: "Running local action: dry-run publish"
+        id: publish
         uses: ./
         with:
-          input: "test input 💬"
+          path_prefix: test-project
+          node_version: '22'
+          publish_version: ${{ matrix.publish_version }}
+          dry_run: 'true'
 
-      - name: "Validated local action: ${{ github.repository }}"
+      - name: "Verify dry-run outputs and version stamp"
         shell: bash
         env:
-          REPO: ${{ github.repository }}
+          PUBLISHED_VERSION: ${{ steps.publish.outputs.published_version }}
+          PACKAGE_NAME: ${{ steps.publish.outputs.package_name }}
+          TARBALL_NAME: ${{ steps.publish.outputs.tarball_name }}
+          EXPECTED_VERSION: ${{ matrix.publish_version }}
+          EXPECTED_NAME: ${{ matrix.expected_name }}
+          EXPECTED_TARBALL: ${{ matrix.expected_tarball }}
         run: |
-          # Local action validation
-          echo "Validated local action: $REPO"
-          echo "Validation step summary output" >> "$GITHUB_STEP_SUMMARY"
+          # Verify dry-run outputs and version stamp
+          errors=0
+          if [ "${PUBLISHED_VERSION}" != "${EXPECTED_VERSION}" ]; then
+            echo "Unexpected published_version ❌"
+            echo "Output: ${PUBLISHED_VERSION}"
+            echo "Expected: ${EXPECTED_VERSION}"
+            errors=1
+          fi
+          if [ "${PACKAGE_NAME}" != "${EXPECTED_NAME}" ]; then
+            echo "Unexpected package_name ❌"
+            echo "Output: ${PACKAGE_NAME}"
+            echo "Expected: ${EXPECTED_NAME}"
+            errors=1
+          fi
+          if [ "${TARBALL_NAME}" != "${EXPECTED_TARBALL}" ]; then
+            echo "Unexpected tarball_name ❌"
+            echo "Output: ${TARBALL_NAME}"
+            echo "Expected: ${EXPECTED_TARBALL}"
+            errors=1
+          fi
+          # The action must stamp the version into package.json
+          stamped="$(jq -r '.version // empty' \
+            test-project/package.json)"
+          if [ "${stamped}" != "${EXPECTED_VERSION}" ]; then
+            echo "Version stamp not applied ❌"
+            echo "package.json version: ${stamped}"
+            echo "Expected: ${EXPECTED_VERSION}"
+            errors=1
+          fi
+          # Dry-run mode must skip the credential machinery, so no
+          # .npmrc may appear in the project directory
+          if [ -f test-project/.npmrc ]; then
+            echo "Dry run wrote an .npmrc ❌"
+            errors=1
+          fi
+          if [ "${errors}" != "0" ]; then
+            echo "Dry-run tests failed ❌" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Dry-run publish verified ✅"
+          {
+            echo "Dry-run publish verified ✅"
+            echo "Package: ${PACKAGE_NAME}@${PUBLISHED_VERSION}"
+            echo "Tarball: ${TARBALL_NAME}"
+          } >> "$GITHUB_STEP_SUMMARY"
 
+  ### Test invalid inputs fail closed ###
+  test-failures:
+    name: "Test: invalid inputs and error handling"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      # Load the egress allow-list out-of-band from the
+      # organisation's .github repository and publish it as
+      # $CONNECTION_ALLOW_LIST for the harden-runner step below.
       # yamllint disable-line rule:line-length
-      - name: "Running local action: ${{ github.repository }} [Override Failure]"
-        uses: ./
-        id: failure
-        continue-on-error: true
+      - uses: lfreleng-actions/harden-runner-block-action@6db537b3e6d060c3287c5a3ce2c28b55b0af330d # v0.2.1
         with:
-          invalid_input: "Some garbage"
+          config: '@807a544b7e55a9224b2b3780e636467bd4b5b99b' # v0.5.0
 
-      # Failure testing is also important
-      - name: "Error if step above did NOT fail"
-        if: steps.failure.outcome == 'success'
+      # Harden the runner with the just-loaded allow-list.
+      - name: "Harden runner (block)"
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Checkout repository"
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      # A minimal project isolates each negative test on its target
+      # input; the placeholder password below is a test literal, not
+      # a real credential
+      - name: "Create minimal project fixture"
         shell: bash
         run: |
-          # Error if step above did NOT fail
-          echo "Error: previous test step did NOT fail ❌"
-          exit 1
+          # Create minimal project fixture
+          mkdir -p fake-project
+          printf '%s\n' \
+            '{"name": "fake-project", "version": "1.0.0"}' \
+            > fake-project/package.json
+
+      - name: "Running local action with shell metacharacters"
+        id: bad-version
+        continue-on-error: true
+        uses: ./
+        with:
+          path_prefix: fake-project
+          publish_version: '1.0.0;rm -rf /'
+          dry_run: 'true'
+
+      - name: "Running local action with newline injection"
+        id: newline-version
+        continue-on-error: true
+        uses: ./
+        with:
+          path_prefix: fake-project
+          publish_version: |
+            1.0.0
+            9.9.9-injected
+          dry_run: 'true'
+
+      - name: "Running local action with invalid registry URL"
+        id: bad-registry
+        continue-on-error: true
+        uses: ./
+        with:
+          path_prefix: fake-project
+          publish_version: '1.0.0'
+          registry_url: 'https://nexus3.example.org/repository/npm'
+          nexus_password: 'placeholder-not-a-secret'
+
+      - name: "Running local action without credentials"
+        id: no-credentials
+        continue-on-error: true
+        uses: ./
+        with:
+          path_prefix: fake-project
+          publish_version: '1.0.0'
+          registry_url: 'https://nexus3.example.org/repository/npm/'
+
+      - name: "Running local action with workspace-escaping path"
+        id: escape-path
+        continue-on-error: true
+        uses: ./
+        with:
+          path_prefix: /etc
+          publish_version: '1.0.0'
+          dry_run: 'true'
+
+      - name: "Running local action with invalid tag"
+        id: bad-tag
+        continue-on-error: true
+        uses: ./
+        with:
+          path_prefix: fake-project
+          publish_version: '1.0.0'
+          tag: 'not a tag'
+          dry_run: 'true'
+
+      - name: "Running local action with invalid access"
+        id: bad-access
+        continue-on-error: true
+        uses: ./
+        with:
+          path_prefix: fake-project
+          publish_version: '1.0.0'
+          access: internal
+          dry_run: 'true'
+
+      - name: "Verify invalid inputs were rejected"
+        shell: bash
+        env:
+          VERSION_OUTCOME: ${{ steps.bad-version.outcome }}
+          NEWLINE_OUTCOME: ${{ steps.newline-version.outcome }}
+          REGISTRY_OUTCOME: ${{ steps.bad-registry.outcome }}
+          CREDENTIALS_OUTCOME: ${{ steps.no-credentials.outcome }}
+          ESCAPE_OUTCOME: ${{ steps.escape-path.outcome }}
+          TAG_OUTCOME: ${{ steps.bad-tag.outcome }}
+          ACCESS_OUTCOME: ${{ steps.bad-access.outcome }}
+        run: |
+          # Failure testing is also important; all steps MUST fail
+          errors=0
+          for outcome_pair in \
+            "version:${VERSION_OUTCOME}" \
+            "newline:${NEWLINE_OUTCOME}" \
+            "registry:${REGISTRY_OUTCOME}" \
+            "credentials:${CREDENTIALS_OUTCOME}" \
+            "escape:${ESCAPE_OUTCOME}" \
+            "tag:${TAG_OUTCOME}" \
+            "access:${ACCESS_OUTCOME}"; do
+            test_name="${outcome_pair%%:*}"
+            outcome="${outcome_pair#*:}"
+            if [ "${outcome}" = "success" ]; then
+              echo "Invalid ${test_name} unexpectedly succeeded ❌"
+              errors=1
+            fi
+          done
+          # The rejected inputs must leave package.json untouched
+          stamped="$(jq -r '.version // empty' \
+            fake-project/package.json)"
+          if [ "${stamped}" != "1.0.0" ]; then
+            echo "Rejected input still stamped a version ❌"
+            echo "package.json version: ${stamped}"
+            errors=1
+          fi
+          if [ "${errors}" != "0" ]; then
+            echo "Failure-path tests failed ❌" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Invalid inputs correctly rejected ✅"
+          echo "Invalid inputs correctly rejected ✅" \
+            >> "$GITHUB_STEP_SUMMARY"

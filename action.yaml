@@ -1,53 +1,692 @@
 ---
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: 2025 The Linux Foundation
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
 
-# actions-template
-name: "🛠️ Actions Template"
-description: "Description of action"
-# Any relevant notes/observations can go here
+# node-publish-action
+name: "🚀 Node.js Package Publish"
+# yamllint disable-line rule:line-length
+description: "Stamps a version into package.json and publishes the package to an npm registry"
+# Composes node-create-npmrc-action for registry authentication, then
+# runs 'npm version' and 'npm publish' with verification. The npmrc
+# action registers a guaranteed post-job step that scrubs the
+# credential file, so this action adds no duplicate cleanup. Dry-run
+# mode skips the credential machinery entirely and performs a local
+# packing exercise with 'npm publish --dry-run'.
 
 inputs:
-  input:
-    description: "Description of input"
+  # Mandatory
+  publish_version:
+    # yamllint disable-line rule:line-length
+    description: "Version to stamp and publish, such as '1.2.3' or '1.2.3-SNAPSHOT'; characters 0-9 A-Z a-z . -"
     required: true
+  # Optional
+  registry_url:
+    # yamllint disable-line rule:line-length
+    description: "Target npm registry URL ending with '/'; required unless dry_run is 'true'; characters A-Z a-z 0-9 . : / _ -"
+    required: false
+    default: ""
+  dry_run:
+    # yamllint disable-line rule:line-length
+    description: "Pack and verify without registry interaction ('true'/'false'); skips credential setup"
+    required: false
+    default: "false"
+  path_prefix:
+    description: "Project directory; must resolve within the workspace"
+    required: false
+    default: "."
+  node_version:
+    # yamllint disable-line rule:line-length
+    description: "Node.js version to set up, such as '22', '22.x' or 'lts/*'; characters A-Z a-z 0-9 . * / _ -"
+    required: false
+    default: "22"
+  node_version_file:
+    # yamllint disable-line rule:line-length
+    description: "File containing the Node.js version, such as '.nvmrc'; takes precedence over node_version; must resolve within the workspace"
+    required: false
+    default: ""
+  tag:
+    # yamllint disable-line rule:line-length
+    description: "npm distribution tag; characters A-Z a-z 0-9 . _ -"
+    required: false
+    default: "latest"
+  access:
+    description: "Package access: 'public', 'restricted' or unset"
+    required: false
+    default: ""
+  provenance:
+    # yamllint disable-line rule:line-length
+    description: "Generate registry-native provenance ('true'/'false'); needs a registry with Sigstore provenance support (npmjs.org) plus OIDC; Nexus lacks support"
+    required: false
+    default: "false"
+  # Credential pass-through for node-create-npmrc-action (unused in
+  # dry-run mode)
+  nexus_user:
+    description: "Registry username (default: calling repository name)"
+    required: false
+    default: ""
+  nexus_password:
+    # yamllint disable-line rule:line-length
+    description: "Registry password/token; required for non-dry-run publishes unless load_credential is 'true'"
+    required: false
+    default: ""
+  load_credential:
+    # yamllint disable-line rule:line-length
+    description: "Fetch the password from 1Password via credential-load-action ('true'/'false')"
+    required: false
+    default: "false"
+  vault_mapping_json:
+    # yamllint disable-line rule:line-length
+    description: "JSON mapping repository owner to 1Password vault (used when load_credential is 'true')"
+    required: false
+    default: ""
+  op_service_account_token:
+    # yamllint disable-line rule:line-length
+    description: "1Password service account token (used when load_credential is 'true')"
+    required: false
+    default: ""
+  scope:
+    description: "npm scope for the auth entry (for example '@onap')"
+    required: false
+    default: ""
 
 outputs:
-  output:
-    description: "Description of output"
-    value: ${{ steps.code.outputs.output }}
+  published_version:
+    description: "Version stamped into package.json and published"
+    value: ${{ steps.publish.outputs.published_version }}
+  package_name:
+    description: "Package name from the publish metadata"
+    value: ${{ steps.publish.outputs.package_name }}
+  tarball_name:
+    description: "Tarball filename from the publish metadata"
+    value: ${{ steps.publish.outputs.tarball_name }}
 
 runs:
   using: "composite"
   steps:
-    - name: "Friendly Name"
-      id: code
+    - name: "Validate inputs"
+      id: validate
       shell: bash
       env:
-        INPUT_VALUE: ${{ inputs.input }}
+        INPUT_PUBLISH_VERSION: ${{ inputs.publish_version }}
+        INPUT_REGISTRY_URL: ${{ inputs.registry_url }}
+        INPUT_DRY_RUN: ${{ inputs.dry_run }}
+        INPUT_PATH_PREFIX: ${{ inputs.path_prefix }}
+        INPUT_NODE_VERSION: ${{ inputs.node_version }}
+        INPUT_NODE_VERSION_FILE: ${{ inputs.node_version_file }}
+        INPUT_TAG: ${{ inputs.tag }}
+        INPUT_ACCESS: ${{ inputs.access }}
+        INPUT_PROVENANCE: ${{ inputs.provenance }}
+        INPUT_LOAD_CREDENTIAL: ${{ inputs.load_credential }}
+        INPUT_NEXUS_PASSWORD: ${{ inputs.nexus_password }}
+        INPUT_VAULT_MAPPING_JSON: ${{ inputs.vault_mapping_json }}
+        INPUT_OP_SERVICE_ACCOUNT_TOKEN: ${{ inputs.op_service_account_token }}
       run: |
-        # Friendly Name
-        input="$INPUT_VALUE"
-        if [ -z "$input" ]; then
-          echo "Error: mandatory input was not set/configured ❌"
+        # Validate inputs
+        # Preflight: fail with a clear message when required tools are
+        # missing (possible on minimal self-hosted runners)
+        for tool in jq realpath mktemp; do
+          if ! command -v "${tool}" > /dev/null 2>&1; then
+            echo "Error: required tool not found: ${tool} ❌"
+            echo "This action requires jq, realpath (GNU coreutils)"
+            echo "and mktemp on the runner"
+            exit 1
+          fi
+        done
+        # The action requires GNU realpath -m (missing-path
+        # resolution); BSD/macOS realpath lacks it, and failing here
+        # gives a clearer error than a mid-run failure
+        if ! realpath -m -- / > /dev/null 2>&1; then
+          echo "Error: realpath does not support the -m option ❌"
+          echo "This action requires GNU coreutils realpath"
+          exit 1
+        fi
+        # The workspace boundary checks depend on these runner
+        # environment variables: an empty value would degrade the
+        # case patterns to /* and disable the escape checks
+        for dir_var in GITHUB_WORKSPACE RUNNER_TEMP; do
+          dir_value="${!dir_var:-}"
+          if [ -z "${dir_value}" ] || [ ! -d "${dir_value}" ]; then
+            echo "Error: ${dir_var} not set to a directory ❌"
+            echo "This action requires a standard runner environment"
+            exit 1
+          fi
+        done
+        # A case glob validates the entire string, including embedded
+        # newlines; grep would only validate per line
+        case "${INPUT_DRY_RUN}" in
+          true|false) ;;
+          *)
+            echo "Error: dry_run must be 'true' or 'false' ❌"
+            exit 1 ;;
+        esac
+        case "${INPUT_PROVENANCE}" in
+          true|false) ;;
+          *)
+            echo "Error: provenance must be 'true' or 'false' ❌"
+            exit 1 ;;
+        esac
+        case "${INPUT_LOAD_CREDENTIAL}" in
+          true|false) ;;
+          *)
+            echo "Error: load_credential must be 'true' or 'false' ❌"
+            exit 1 ;;
+        esac
+        case "${INPUT_ACCESS}" in
+          ''|public|restricted) ;;
+          *)
+            echo "Error: invalid access ❌"
+            echo "Expected: 'public', 'restricted' or unset"
+            exit 1 ;;
+        esac
+        # Restrict the distribution tag to a safe character set; the
+        # value becomes an npm publish argument
+        case "${INPUT_TAG}" in
+          *[!A-Za-z0-9._-]*|'')
+            echo "Error: invalid tag ❌"
+            echo "Allowed characters: A-Z a-z 0-9 . _ -"
+            exit 1 ;;
+        esac
+        # The version needs a strict allowlist (no shell
+        # metacharacters, no whitespace, no embedded newlines) plus a
+        # structural check for three all-digit, dot-separated
+        # segments; a '-' suffix such as '-SNAPSHOT' or '-rc.1' may
+        # follow the third segment
+        case "${INPUT_PUBLISH_VERSION}" in
+          *[!0-9A-Za-z.-]*|'')
+            echo "Error: invalid publish_version ❌"
+            echo "Allowed characters: 0-9 A-Z a-z . -"
+            exit 1 ;;
+        esac
+        version_error() {
+          echo "Error: invalid publish_version ❌"
+          echo "Expected a semver-style version such as 1.2.3,"
+          echo "1.2.3-SNAPSHOT or 1.2.3-rc.1"
+          exit 1
+        }
+        case "${INPUT_PUBLISH_VERSION}" in
+          *.*.*) ;;
+          *) version_error ;;
+        esac
+        major="${INPUT_PUBLISH_VERSION%%.*}"
+        minor_rest="${INPUT_PUBLISH_VERSION#*.}"
+        minor="${minor_rest%%.*}"
+        rest="${minor_rest#*.}"
+        patch="${rest%%-*}"
+        # MAJOR, MINOR and PATCH must contain digits alone; the
+        # allowlist above already constrains any suffix after the
+        # first '-'
+        for segment in "${major}" "${minor}" "${patch}"; do
+          case "${segment}" in
+            ''|*[!0-9]*) version_error ;;
+          esac
+        done
+        # The registry URL is mandatory for real publishes; dry-run
+        # mode performs no registry interaction. Validate any provided
+        # value: https scheme, trailing slash, non-empty host and a
+        # character allowlist that excludes whitespace, userinfo
+        # separators and shell metacharacters
+        if [ "${INPUT_DRY_RUN}" != "true" ] && \
+          [ -z "${INPUT_REGISTRY_URL}" ]; then
+          echo "Error: registry_url required unless dry_run ❌"
+          exit 1
+        fi
+        if [ -n "${INPUT_REGISTRY_URL}" ]; then
+          case "${INPUT_REGISTRY_URL}" in
+            *[!A-Za-z0-9.:/_-]*)
+              echo "Error: invalid registry_url characters ❌"
+              echo "Allowed characters: A-Z a-z 0-9 . : / _ -"
+              exit 1 ;;
+          esac
+          case "${INPUT_REGISTRY_URL}" in
+            https://?*/) ;;
+            *)
+              echo "Error: invalid registry_url ❌"
+              echo "Expected https://<host>/<path>/ with a"
+              echo "trailing slash"
+              exit 1 ;;
+          esac
+          case "${INPUT_REGISTRY_URL}" in
+            https:///*)
+              echo "Error: registry_url must include a host ❌"
+              exit 1 ;;
+          esac
+        fi
+        # Real publishes need a credential source; failing here gives
+        # a clearer error than a mid-publish authentication failure
+        if [ "${INPUT_DRY_RUN}" != "true" ] && \
+          [ "${INPUT_LOAD_CREDENTIAL}" != "true" ] && \
+          [ -z "${INPUT_NEXUS_PASSWORD}" ]; then
+          echo "Error: no registry credential configured ❌"
+          echo "Provide nexus_password, or set load_credential to"
+          echo "'true' (with vault_mapping_json and"
+          echo "op_service_account_token)"
+          exit 1
+        fi
+        # load_credential needs both companion inputs; check
+        # empty/non-empty alone and never echo the values (secrets)
+        if [ "${INPUT_DRY_RUN}" != "true" ] && \
+          [ "${INPUT_LOAD_CREDENTIAL}" = "true" ]; then
+          if [ -z "${INPUT_VAULT_MAPPING_JSON}" ]; then
+            echo "Error: load_credential is 'true' but" \
+              "vault_mapping_json is empty ❌"
+            echo "Provide vault_mapping_json alongside"
+            echo "load_credential"
+            exit 1
+          fi
+          if [ -z "${INPUT_OP_SERVICE_ACCOUNT_TOKEN}" ]; then
+            echo "Error: load_credential is 'true' but" \
+              "op_service_account_token is empty ❌"
+            echo "Provide op_service_account_token alongside"
+            echo "load_credential"
+            exit 1
+          fi
+        fi
+        # Restrict the Node.js version specifier to a safe character
+        # set; the value flows into the setup-node action input
+        if [ -n "${INPUT_NODE_VERSION}" ]; then
+          case "${INPUT_NODE_VERSION}" in
+            *[!A-Za-z0-9./*_-]*)
+              echo "Error: invalid node_version ❌"
+              echo "Allowed characters: A-Z a-z 0-9 . * / _ -"
+              exit 1 ;;
+          esac
+        fi
+        # The version file takes precedence over node_version; check
+        # its character set, then confirm it resolves to a file within
+        # the workspace
+        node_version="${INPUT_NODE_VERSION}"
+        node_version_file=""
+        if [ -n "${INPUT_NODE_VERSION_FILE}" ]; then
+          case "${INPUT_NODE_VERSION_FILE}" in
+            *[!A-Za-z0-9./_-]*)
+              echo "Error: invalid node_version_file ❌"
+              echo "Allowed characters: A-Z a-z 0-9 . / _ -"
+              exit 1 ;;
+          esac
+          case "${INPUT_NODE_VERSION_FILE}" in
+            /*) version_file="${INPUT_NODE_VERSION_FILE}" ;;
+            *)
+              version_file="${GITHUB_WORKSPACE}/"
+              version_file="${version_file}${INPUT_NODE_VERSION_FILE}"
+              ;;
+          esac
+          if [ ! -f "${version_file}" ]; then
+            echo "Error: node_version_file not found ❌"
+            exit 1
+          fi
+          # Fail closed: an empty result from a failed realpath
+          # would degrade the case pattern below to /* and accept
+          # any path
+          if ! resolved="$(realpath -- "${version_file}")" || \
+            [ -z "${resolved}" ]; then
+            echo "Error: cannot resolve node_version_file ❌"
+            exit 1
+          fi
+          if ! workspace="$(realpath -- "${GITHUB_WORKSPACE}")" || \
+            [ -z "${workspace}" ]; then
+            echo "Error: cannot resolve GITHUB_WORKSPACE ❌"
+            exit 1
+          fi
+          case "${resolved}/" in
+            "${workspace}/"*) ;;
+            *)
+              echo "Error: node_version_file escapes the workspace ❌"
+              exit 1 ;;
+          esac
+          node_version=""
+          node_version_file="${INPUT_NODE_VERSION_FILE}"
+        fi
+        if [ -z "${node_version}" ] && [ -z "${node_version_file}" ]; then
+          echo "Error: no Node.js version specified ❌"
+          echo "Provide node_version or node_version_file"
+          exit 1
+        fi
+        # Anchor relative paths to GITHUB_WORKSPACE: composite
+        # actions can run with a caller-set working directory, so
+        # resolving against the current directory would be
+        # non-deterministic
+        case "${INPUT_PATH_PREFIX}" in
+          /*) project_dir="${INPUT_PATH_PREFIX}" ;;
+          *) project_dir="${GITHUB_WORKSPACE}/${INPUT_PATH_PREFIX}" ;;
+        esac
+        if [ ! -d "${project_dir}" ]; then
+          echo "Error: invalid project directory ❌"
+          # Strip CR/LF before logging the untrusted path: embedded
+          # newlines could otherwise inject workflow commands via the
+          # log stream
+          printf 'Path not found: %s\n' \
+            "$(printf '%s' "${project_dir}" | tr -d '\r\n')"
+          exit 1
+        fi
+        # Restrict publishing to the workspace: an absolute or
+        # escaped path could otherwise pack and publish arbitrary
+        # runner filesystem content. Fail closed on realpath failure:
+        # an empty result would degrade the case pattern below to /*
+        # and accept any path
+        if ! resolved="$(realpath -- "${project_dir}")" || \
+          [ -z "${resolved}" ]; then
+          echo "Error: cannot resolve project directory ❌"
+          exit 1
+        fi
+        if ! workspace="$(realpath -- "${GITHUB_WORKSPACE}")" || \
+          [ -z "${workspace}" ]; then
+          echo "Error: cannot resolve GITHUB_WORKSPACE ❌"
+          exit 1
+        fi
+        case "${resolved}/" in
+          "${workspace}/"*) ;;
+          *)
+            echo "Error: project directory escapes the workspace ❌"
+            echo "path_prefix must resolve within GITHUB_WORKSPACE"
+            exit 1 ;;
+        esac
+        if [ ! -f "${resolved}/package.json" ]; then
+          echo "Error: no package.json in project directory ❌"
+          exit 1
+        fi
+        # Both values passed the character allowlists above, so the
+        # plain output format is safe here
+        echo "node_version=${node_version}" >> "$GITHUB_OUTPUT"
+        echo "node_version_file=${node_version_file}" >> "$GITHUB_OUTPUT"
+
+    - name: "Setup Node.js"
+      # yamllint disable-line rule:line-length
+      uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+      with:
+        node-version: ${{ steps.validate.outputs.node_version }}
+        node-version-file: ${{ steps.validate.outputs.node_version_file }}
+
+    # Dry-run mode performs no registry interaction, so it skips the
+    # credential machinery entirely. For real publishes the npmrc
+    # action writes the authenticated .npmrc and registers a
+    # guaranteed post-job step that scrubs it again
+    - name: "Create authenticated .npmrc"
+      if: inputs.dry_run != 'true'
+      # yamllint disable-line rule:line-length
+      uses: lfreleng-actions/node-create-npmrc-action@ddf719ee65057195bcb7c813ec54df9b7db25e1d # v0.1.1
+      with:
+        registry_url: ${{ inputs.registry_url }}
+        nexus_user: ${{ inputs.nexus_user }}
+        nexus_password: ${{ inputs.nexus_password }}
+        load_credential: ${{ inputs.load_credential }}
+        vault_mapping_json: ${{ inputs.vault_mapping_json }}
+        op_service_account_token: ${{ inputs.op_service_account_token }}
+        scope: ${{ inputs.scope }}
+        path: ${{ inputs.path_prefix }}
+
+    - name: "Stamp version into package.json"
+      id: stamp
+      shell: bash
+      env:
+        PROJECT_DIR: ${{ inputs.path_prefix }}
+        PUBLISH_VERSION: ${{ inputs.publish_version }}
+      run: |
+        # Stamp version into package.json
+        # setup-node provides node/npm; confirm before use in case a
+        # caller-side setup problem left the tools unavailable
+        for tool in node npm; do
+          if ! command -v "${tool}" > /dev/null 2>&1; then
+            echo "Error: required tool not found: ${tool} ❌"
+            exit 1
+          fi
+        done
+        # Anchor relative paths to GITHUB_WORKSPACE so behaviour stays
+        # deterministic when the caller sets a working directory. The
+        # :? expansions hard-fail on unset/empty runner variables,
+        # which would otherwise weaken the boundary checks below
+        case "${PROJECT_DIR}" in
+          /*) ;;
+          *) PROJECT_DIR="${GITHUB_WORKSPACE:?}/${PROJECT_DIR}" ;;
+        esac
+        # Re-resolve and enforce the workspace boundary at the point
+        # of use: the workspace is mutable between steps, so relying
+        # solely on the earlier validate step would leave a TOCTOU
+        # gap (a validated directory swapped for an escaping
+        # symlink). Fail closed on realpath failure: an empty result
+        # would degrade the case pattern below to /* and accept any
+        # path
+        if ! PROJECT_DIR="$(realpath -- "${PROJECT_DIR}")" || \
+          [ -z "${PROJECT_DIR}" ]; then
+          echo "Error: cannot resolve project directory ❌"
+          exit 1
+        fi
+        if ! boundary="$(realpath -- "${GITHUB_WORKSPACE:?}")" || \
+          [ -z "${boundary}" ]; then
+          echo "Error: cannot resolve GITHUB_WORKSPACE ❌"
+          exit 1
+        fi
+        case "${PROJECT_DIR}/" in
+          "${boundary}/"*) ;;
+          *)
+            echo "Error: project directory escapes the workspace ❌"
+            echo "path_prefix must resolve within GITHUB_WORKSPACE"
+            exit 1 ;;
+        esac
+        cd "${PROJECT_DIR}" || exit 1
+        # Versions get stamped at publish time in the Linux
+        # Foundation merge-driven model, so the committed
+        # package.json version is not the source of truth;
+        # --allow-same-version keeps re-stamping idempotent
+        npm version "${PUBLISH_VERSION}" --no-git-tag-version \
+          --allow-same-version
+        stamped="$(jq -r '.version // empty' package.json)"
+        if [ "${stamped}" != "${PUBLISH_VERSION}" ]; then
+          echo "Error: version stamp verification failed ❌"
+          printf 'package.json version: %s\n' \
+            "$(printf '%s' "${stamped}" | tr -d '\r\n')"
+          exit 1
+        fi
+        echo "Stamped version ${PUBLISH_VERSION} into package.json ✅"
+
+    - name: "Publish package"
+      id: publish
+      shell: bash
+      env:
+        PROJECT_DIR: ${{ inputs.path_prefix }}
+        PUBLISH_VERSION: ${{ inputs.publish_version }}
+        DRY_RUN: ${{ inputs.dry_run }}
+        TAG: ${{ inputs.tag }}
+        ACCESS: ${{ inputs.access }}
+        PROVENANCE: ${{ inputs.provenance }}
+        REGISTRY_URL: ${{ inputs.registry_url }}
+      run: |
+        # Publish package
+        # Anchor relative paths to GITHUB_WORKSPACE and re-enforce
+        # the workspace boundary at the point of use (TOCTOU). Fail
+        # closed on realpath failure: an empty result would degrade
+        # the case pattern below to /* and accept any path
+        case "${PROJECT_DIR}" in
+          /*) ;;
+          *) PROJECT_DIR="${GITHUB_WORKSPACE:?}/${PROJECT_DIR}" ;;
+        esac
+        if ! PROJECT_DIR="$(realpath -- "${PROJECT_DIR}")" || \
+          [ -z "${PROJECT_DIR}" ]; then
+          echo "Error: cannot resolve project directory ❌"
+          exit 1
+        fi
+        if ! boundary="$(realpath -- "${GITHUB_WORKSPACE:?}")" || \
+          [ -z "${boundary}" ]; then
+          echo "Error: cannot resolve GITHUB_WORKSPACE ❌"
+          exit 1
+        fi
+        case "${PROJECT_DIR}/" in
+          "${boundary}/"*) ;;
+          *)
+            echo "Error: project directory escapes the workspace ❌"
+            echo "path_prefix must resolve within GITHUB_WORKSPACE"
+            exit 1 ;;
+        esac
+        # Scratch directory for the publish metadata; removed on step
+        # exit because RUNNER_TEMP is not always cleaned between runs
+        # on self-hosted runners
+        scratch_dir="$(mktemp -d "${RUNNER_TEMP:?}/npmpublish.XXXXXX")"
+        trap 'rm -rf -- "${scratch_dir}"' EXIT
+
+        # Build the publish arguments from validated inputs; every
+        # value passed a whole-string allowlist in the validate step
+        set -- publish --json --tag "${TAG}"
+        if [ -n "${ACCESS}" ]; then
+          set -- "$@" --access "${ACCESS}"
+        fi
+        if [ "${PROVENANCE}" = "true" ]; then
+          set -- "$@" --provenance
+        fi
+        if [ "${DRY_RUN}" = "true" ]; then
+          set -- "$@" --dry-run
+          echo "Publishing in dry-run mode (no registry interaction)"
+        else
+          set -- "$@" --registry "${REGISTRY_URL}"
+        fi
+
+        cd "${PROJECT_DIR}" || exit 1
+        set +e
+        npm "$@" > "${scratch_dir}/publish.json"
+        publish_exit=$?
+        set -e
+        if [ "${publish_exit}" != "0" ]; then
+          echo "::error::npm publish failed (exit ${publish_exit}) ❌"
           exit 1
         fi
 
-        # Write the output using the multiline heredoc format with a random
-        # delimiter so that an input containing newlines cannot inject
-        # additional keys into $GITHUB_OUTPUT (output-file injection). The
-        # delimiter is built from shell-builtin randomness (no external
-        # tools such as openssl/uuidgen, which are not guaranteed on
-        # self-hosted runners) and regenerated until it is provably absent
-        # from the value being emitted.
-        delimiter="ghadelim_${RANDOM}${RANDOM}${RANDOM}${RANDOM}"
-        while [[ "$input" == *"$delimiter"* ]]; do
+        # The --json output carries the publish metadata; verify it
+        # matches the requested version before emitting outputs
+        package_name="$(jq -r '.name // empty' \
+          "${scratch_dir}/publish.json")"
+        published_version="$(jq -r '.version // empty' \
+          "${scratch_dir}/publish.json")"
+        tarball_name="$(jq -r '.filename // empty' \
+          "${scratch_dir}/publish.json")"
+        # Constrain the reported name to the npm package name
+        # character set before further use in commands and logs
+        case "${package_name}" in
+          *[!@A-Za-z0-9._/-]*|'')
+            echo "Error: npm reported an unusable package name ❌"
+            exit 1 ;;
+        esac
+        if [ "${published_version}" != "${PUBLISH_VERSION}" ]; then
+          echo "Error: published version mismatch ❌"
+          printf 'npm reported: %s\n' \
+            "$(printf '%s' "${published_version}" | tr -d '\r\n')"
+          echo "Expected: ${PUBLISH_VERSION}"
+          exit 1
+        fi
+        if [ -z "${tarball_name}" ]; then
+          echo "Error: npm reported no tarball filename ❌"
+          exit 1
+        fi
+
+        # The metadata values originate from npm's JSON output and
+        # could legally contain unusual characters, so they use the
+        # multiline heredoc output format with a random delimiter
+        # (built from shell-builtin randomness, regenerated until
+        # provably absent from the value) to prevent output-file
+        # injection
+        emit_output() {
+          key="$1"
+          value="$2"
           delimiter="ghadelim_${RANDOM}${RANDOM}${RANDOM}${RANDOM}"
-        done
+          while [ "${value#*"${delimiter}"}" != "${value}" ]; do
+            delimiter="ghadelim_${RANDOM}${RANDOM}${RANDOM}${RANDOM}"
+          done
+          {
+            printf '%s<<%s\n' "${key}" "${delimiter}"
+            printf '%s\n' "${value}"
+            printf '%s\n' "${delimiter}"
+          } >> "$GITHUB_OUTPUT"
+        }
+        emit_output "published_version" "${published_version}"
+        emit_output "package_name" "${package_name}"
+        emit_output "tarball_name" "${tarball_name}"
+
+        echo "Published ${package_name}@${published_version} ✅"
         {
-          printf '%s<<%s\n' 'output' "$delimiter"
-          printf '%s\n' "$input"
-          printf '%s\n' "$delimiter"
-        } >> "$GITHUB_OUTPUT"
-        echo "Action received: $input ✅"
-        echo "Action received: $input ✅" >> "$GITHUB_STEP_SUMMARY"
+          echo "## 🚀 Node.js Package Publish"
+          echo ""
+          if [ "${DRY_RUN}" = "true" ]; then
+            echo "**Mode:** dry run (no registry interaction)"
+          else
+            echo "**Mode:** publish"
+            echo "**Registry:** ${REGISTRY_URL}"
+          fi
+          echo "**Package:** ${package_name}"
+          echo "**Version:** ${published_version}"
+          echo "**Tag:** ${TAG}"
+          echo "**Tarball:** ${tarball_name}"
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    # Best-effort registry confirmation for real publishes: some
+    # registries restrict anonymous reads or index asynchronously, so
+    # an unreadable package downgrades to a warning; a readable
+    # package with the wrong version fails the action
+    - name: "Verify publication on registry"
+      if: inputs.dry_run != 'true'
+      shell: bash
+      env:
+        PROJECT_DIR: ${{ inputs.path_prefix }}
+        PACKAGE_NAME: ${{ steps.publish.outputs.package_name }}
+        PUBLISHED_VERSION: ${{ steps.publish.outputs.published_version }}
+        REGISTRY_URL: ${{ inputs.registry_url }}
+      run: |
+        # Verify publication on registry
+        # Anchor relative paths to GITHUB_WORKSPACE and re-enforce
+        # the workspace boundary at the point of use (TOCTOU). Fail
+        # closed on realpath failure: an empty result would degrade
+        # the case pattern below to /* and accept any path
+        case "${PROJECT_DIR}" in
+          /*) ;;
+          *) PROJECT_DIR="${GITHUB_WORKSPACE:?}/${PROJECT_DIR}" ;;
+        esac
+        if ! PROJECT_DIR="$(realpath -- "${PROJECT_DIR}")" || \
+          [ -z "${PROJECT_DIR}" ]; then
+          echo "Error: cannot resolve project directory ❌"
+          exit 1
+        fi
+        if ! boundary="$(realpath -- "${GITHUB_WORKSPACE:?}")" || \
+          [ -z "${boundary}" ]; then
+          echo "Error: cannot resolve GITHUB_WORKSPACE ❌"
+          exit 1
+        fi
+        case "${PROJECT_DIR}/" in
+          "${boundary}/"*) ;;
+          *)
+            echo "Error: project directory escapes the workspace ❌"
+            exit 1 ;;
+        esac
+        # Re-validate values that crossed a step boundary before use
+        case "${PACKAGE_NAME}" in
+          *[!@A-Za-z0-9._/-]*|'')
+            echo "Error: unusable package name for verification ❌"
+            exit 1 ;;
+        esac
+        case "${PUBLISHED_VERSION}" in
+          *[!0-9A-Za-z.-]*|'')
+            echo "Error: unusable version for verification ❌"
+            exit 1 ;;
+        esac
+        # Run from the project directory so the authenticated .npmrc
+        # written by node-create-npmrc-action applies
+        cd "${PROJECT_DIR}" || exit 1
+        set +e
+        seen="$(npm view "${PACKAGE_NAME}@${PUBLISHED_VERSION}" \
+          version --registry "${REGISTRY_URL}" 2>/dev/null)"
+        view_exit=$?
+        set -e
+        if [ "${view_exit}" != "0" ]; then
+          echo "::warning::could not confirm" \
+            "${PACKAGE_NAME}@${PUBLISHED_VERSION} on the registry" \
+            "(anonymous reads may be restricted, or indexing" \
+            "may lag)"
+          exit 0
+        fi
+        if [ "${seen}" != "${PUBLISHED_VERSION}" ]; then
+          echo "Error: registry reports an unexpected version ❌"
+          printf 'Registry reported: %s\n' \
+            "$(printf '%s' "${seen}" | tr -d '\r\n')"
+          echo "Expected: ${PUBLISHED_VERSION}"
+          exit 1
+        fi
+        echo "Registry confirmed" \
+          "${PACKAGE_NAME}@${PUBLISHED_VERSION} ✅"
+        echo "Registry confirmed" \
+          "${PACKAGE_NAME}@${PUBLISHED_VERSION} ✅" \
+          >> "$GITHUB_STEP_SUMMARY"
