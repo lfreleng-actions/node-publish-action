@@ -7,7 +7,13 @@ name: "Test GitHub Action 🧪"
 
 # yamllint disable-line rule:truthy
 on:
-  workflow_dispatch:
+  # No workflow_dispatch: a manual run happens on the default branch,
+  # which would hand this job a cache token with write access to the
+  # default-branch scope while it runs the local action against
+  # third-party fixture repositories, letting that untrusted code
+  # poison caches later runs restore (CWE-349). The fixtures stay
+  # pinned to explicit commit SHAs, which is what bounds the same
+  # exposure on the push trigger below.
   push:
     branches: ["main"]
   pull_request:
