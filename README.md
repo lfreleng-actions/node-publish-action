@@ -125,8 +125,10 @@ The `nexus_user`, `scope` and credential inputs pass through to
 2. **Authenticate** (real publishes): `node-create-npmrc-action`
    writes an authenticated `.npmrc` into the project directory
 3. **Stamp**: `npm version <X> --no-git-tag-version
-   --allow-same-version` updates `package.json`, with the result
-   read back and verified
+   --allow-same-version --ignore-scripts` updates `package.json`,
+   with the result read back and verified. A `::notice::` names any
+   `preversion`/`version`/`postversion` scripts the project defines,
+   since `--ignore-scripts` means they do not run
 4. **Publish**: `npm publish --json` with the configured tag, access
    and provenance flags; the action parses the JSON metadata and
    verifies the published version matches the request
@@ -179,6 +181,14 @@ touches the path. Paths that escape the workspace fail the action.
   organisation's cache-poisoning stance
 - `--allow-same-version` keeps re-stamping idempotent when the
   committed `package.json` version already matches the request
+- Stamping uses `--ignore-scripts`, so `preversion`, `version` and
+  `postversion` do not run. No release lane installs dependencies
+  before stamping, so a hook invoking the test or build script could
+  not succeed; suppressing them keeps the merge-driven and tag-driven
+  lanes producing the same tree. The action emits a `::notice::`
+  naming the skipped scripts, because a dependency-free `version`
+  hook (writing the version into a source constant, say) would
+  otherwise go missing from the published package with no signal
 - Publishing runs `prepublishOnly`/`prepack`/`prepare` scripts when
   the project defines them; run builds beforehand (for example via
   [node-build-action](https://github.com/lfreleng-actions/node-build-action))

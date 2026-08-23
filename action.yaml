@@ -463,12 +463,32 @@ runs:
             exit 1 ;;
         esac
         cd "${PROJECT_DIR}" || exit 1
+        # Surface suppressed lifecycle hooks before stamping. The
+        # --ignore-scripts below means anything they would have done
+        # (writing the version into a source constant, updating a
+        # changelog) does not happen, so the published package keeps
+        # its pre-stamp content. That is silent otherwise.
+        hooks="$(jq -r '[(.scripts // {}) | keys[]
+          | select(. == "preversion" or . == "version"
+                   or . == "postversion")] | join(", ")' \
+          package.json)"
+        if [ -n "${hooks}" ]; then
+          echo "::notice::Skipped npm version lifecycle script(s):" \
+            "${hooks}. Release lanes stamp without installing" \
+            "dependencies, so these do not run; anything they write" \
+            "into the package is absent from the published artefact."
+        fi
         # Versions get stamped at publish time in the Linux
         # Foundation merge-driven model, so the committed
         # package.json version is not the source of truth;
-        # --allow-same-version keeps re-stamping idempotent
+        # --allow-same-version keeps re-stamping idempotent.
+        #
+        # --ignore-scripts because no release lane installs
+        # dependencies before stamping, so a preversion/version hook
+        # invoking the test or build script cannot succeed. Both
+        # lanes suppress them, so the two produce the same tree.
         npm version "${PUBLISH_VERSION}" --no-git-tag-version \
-          --allow-same-version
+          --allow-same-version --ignore-scripts
         stamped="$(jq -r '.version // empty' package.json)"
         if [ "${stamped}" != "${PUBLISH_VERSION}" ]; then
           echo "Error: version stamp verification failed ❌"
