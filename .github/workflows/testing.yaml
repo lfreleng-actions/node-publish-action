@@ -303,3 +303,99 @@ jobs:
           echo "Invalid inputs correctly rejected ✅"
           echo "Invalid inputs correctly rejected ✅" \
             >> "$GITHUB_STEP_SUMMARY"
+
+  ### Test version lifecycle scripts stay suppressed ###
+  test-lifecycle-hooks:
+    name: "Test: version lifecycle scripts do not run"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      # Load the egress allow-list out-of-band from the
+      # organisation's .github repository and publish it as
+      # $CONNECTION_ALLOW_LIST for the harden-runner step below.
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@6db537b3e6d060c3287c5a3ce2c28b55b0af330d # v0.2.1
+        with:
+          config: '@807a544b7e55a9224b2b3780e636467bd4b5b99b' # v0.5.0
+
+      # Harden the runner with the just-loaded allow-list.
+      - name: "Harden runner (block)"
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Checkout repository"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Each hook writes a marker file. Their absence after the run
+      # proves --ignore-scripts suppressed them, rather than the hook
+      # merely producing no visible output.
+      - name: "Create project fixture with version lifecycle hooks"
+        shell: bash
+        run: |
+          # Create project fixture with version lifecycle hooks
+          mkdir -p hook-project
+          cat > hook-project/package.json << 'FIXTURE'
+          {
+            "name": "hook-project",
+            "version": "1.0.0",
+            "scripts": {
+              "preversion": "touch preversion.marker",
+              "version": "touch version.marker",
+              "postversion": "touch postversion.marker"
+            }
+          }
+          FIXTURE
+          jq -e . hook-project/package.json > /dev/null
+
+      - name: "Run local action against the hook fixture"
+        id: hooks
+        uses: ./
+        with:
+          path_prefix: hook-project
+          publish_version: '2.3.4'
+          node_version: '22'
+          dry_run: 'true'
+
+      - name: "Verify hooks stayed suppressed and version stamped"
+        shell: bash
+        env:
+          PUBLISHED_VERSION: ${{ steps.hooks.outputs.published_version }}
+        run: |
+          # Verify hooks stayed suppressed and the version still stamped
+          errors=0
+          for hook in preversion version postversion; do
+            if [ -f "hook-project/${hook}.marker" ]; then
+              echo "Lifecycle script '${hook}' ran despite" \
+                "--ignore-scripts ❌"
+              errors=1
+            fi
+          done
+          # Suppression must not cost the stamp itself
+          stamped="$(jq -r '.version // empty' \
+            hook-project/package.json)"
+          if [ "${stamped}" != "2.3.4" ]; then
+            echo "Version stamp not applied ❌"
+            echo "package.json version: ${stamped}"
+            errors=1
+          fi
+          if [ "${PUBLISHED_VERSION}" != "2.3.4" ]; then
+            echo "Unexpected published_version ❌"
+            echo "Output: ${PUBLISHED_VERSION}"
+            errors=1
+          fi
+          if [ "${errors}" != "0" ]; then
+            echo "Lifecycle suppression tests failed ❌" \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Version lifecycle scripts correctly suppressed ✅"
+          echo "Version lifecycle scripts correctly suppressed ✅" \
+            >> "$GITHUB_STEP_SUMMARY"
