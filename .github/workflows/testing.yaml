@@ -399,3 +399,98 @@ jobs:
           echo "Version lifecycle scripts correctly suppressed ✅"
           echo "Version lifecycle scripts correctly suppressed ✅" \
             >> "$GITHUB_STEP_SUMMARY"
+
+  ### Test the publish metadata shape normalisation ###
+  # npm 10 put name/version/filename at the top level; npm 11 keys
+  # the object by package name. The action normalises both, and the
+  # discriminator has to be the *type* of .name rather than its
+  # presence, because a package legitimately called 'name' produces
+  # {"name": {...}} under npm 11.
+  #
+  # No fixture can cover that: a dry run for a package named 'name'
+  # would query the real registry, where that name is taken. So the
+  # expression is extracted from action.yaml and run over the shapes
+  # directly -- extracted rather than restated, so a regression in
+  # the shipped filter fails the test.
+  test-publish-metadata:
+    name: "Test: publish metadata normalisation"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      # Load the egress allow-list out-of-band from the
+      # organisation's .github repository and publish it as
+      # $CONNECTION_ALLOW_LIST for the harden-runner step below.
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@6db537b3e6d060c3287c5a3ce2c28b55b0af330d # v0.2.1
+        with:
+          config: '@807a544b7e55a9224b2b3780e636467bd4b5b99b' # v0.5.0
+
+      # Harden the runner with the just-loaded allow-list.
+      - name: "Harden runner (block)"
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Checkout repository"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: "Exercise the metadata filter over both npm shapes"
+        shell: bash
+        run: |
+          # Exercise the metadata filter over both npm shapes
+          # shellcheck disable=SC2016  # a jq filter, not a shell var
+          raw="$(grep -A1 -m1 '^        meta="\$(jq -c' action.yaml)"
+          filter="${raw#*jq -c \'}"
+          filter="${filter%\' \\}"
+          # Fail loudly rather than silently testing nothing if the
+          # expression is renamed or reindented
+          if ! printf '%s' "${filter}" | grep -q 'to_entries'; then
+            echo "Could not extract the metadata filter ❌"
+            echo "Update the extraction in this job to match"
+            exit 1
+          fi
+          errors=0
+          check() {
+            got="$(printf '%s' "$2" | jq -c "${filter}" 2>/dev/null \
+              | jq -r '[(.name|tostring), (.version|tostring),
+                        (.filename|tostring)] | join(" ")' \
+              2>/dev/null)"
+            if [ "${got}" != "$3" ]; then
+              echo "$1: got '${got}', want '$3' ❌"
+              errors=1
+            fi
+          }
+          check 'npm10 flat' \
+            '{"name":"pkg","version":"1.0.0","filename":"pkg.tgz"}' \
+            'pkg 1.0.0 pkg.tgz'
+          check 'npm11 keyed' \
+            '{"pkg":{"name":"pkg","version":"1.0.0","filename":"pkg.tgz"}}' \
+            'pkg 1.0.0 pkg.tgz'
+          scoped_in='{"@onap/ui":{"name":"@onap/ui",'
+          scoped_in="${scoped_in}"'"version":"2.0.0",'
+          scoped_in="${scoped_in}"'"filename":"onap-ui-2.0.0.tgz"}}'
+          check 'npm11 scoped key' "${scoped_in}" \
+            '@onap/ui 2.0.0 onap-ui-2.0.0.tgz'
+          named_in='{"name":{"name":"name","version":"3.0.0",'
+          named_in="${named_in}"'"filename":"name-3.0.0.tgz"}}'
+          check 'npm11 package literally named name' "${named_in}" \
+            'name 3.0.0 name-3.0.0.tgz'
+          check 'npm10 package literally named name' \
+            '{"name":"name","version":"3.0.0","filename":"name-3.0.0.tgz"}' \
+            'name 3.0.0 name-3.0.0.tgz'
+          check 'empty object fails closed' '{}' 'null null null'
+          if [ "${errors}" != "0" ]; then
+            echo "Metadata normalisation tests failed ❌" \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Publish metadata normalisation correct ✅"
+          echo "Publish metadata normalisation correct ✅" \
+            >> "$GITHUB_STEP_SUMMARY"

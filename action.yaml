@@ -569,13 +569,30 @@ runs:
         fi
 
         # The --json output carries the publish metadata; verify it
-        # matches the requested version before emitting outputs
-        package_name="$(jq -r '.name // empty' \
+        # matches the requested version before emitting outputs.
+        #
+        # npm 11 keys that object by package name, where npm 10 put
+        # the fields at the top level. Reading the top level on npm
+        # 11 returns empty for every field, so the action aborts --
+        # after the package has already reached the registry.
+        # Normalise to the inner object so both shapes parse, rather
+        # than pinning this action to an npm generation.
+        #
+        # Select on the type of .name rather than its presence. A
+        # package legitimately named "name" produces {"name": {...}}
+        # under npm 11, which a presence test reads as the npm 10
+        # flat shape and hands back the metadata object as the
+        # package name -- failing the publish after it succeeded.
+        # Under npm 10 .name is a string; under npm 11 it is either
+        # absent or the nested object.
+        meta="$(jq -c 'if (.name | type) == "string" then .
+          else (to_entries | .[0].value // {}) end' \
           "${scratch_dir}/publish.json")"
-        published_version="$(jq -r '.version // empty' \
-          "${scratch_dir}/publish.json")"
-        tarball_name="$(jq -r '.filename // empty' \
-          "${scratch_dir}/publish.json")"
+        package_name="$(printf '%s' "${meta}" | jq -r '.name // empty')"
+        published_version="$(printf '%s' "${meta}" \
+          | jq -r '.version // empty')"
+        tarball_name="$(printf '%s' "${meta}" \
+          | jq -r '.filename // empty')"
         # Constrain the reported name to the npm package name
         # character set before further use in commands and logs
         case "${package_name}" in
