@@ -862,3 +862,292 @@ jobs:
           echo "Publishing confined to the target package ✅"
           echo "Publishing confined to the target package ✅" \
             >> "$GITHUB_STEP_SUMMARY"
+
+  ### Test authentication mode validation ###
+  # CI has no registry credentials and completes no publish, so
+  # tests use dry-run mode wherever the path under test allows it.
+  # The token pass-through case cannot be a dry run, because dry-run
+  # mode skips the very step it exercises: the .npmrc generation.
+  test-auth-modes:
+    name: "Test: authentication mode validation"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      # Load the egress allow-list out-of-band from the
+      # organisation's .github repository and publish it as
+      # $CONNECTION_ALLOW_LIST for the harden-runner step below.
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@6db537b3e6d060c3287c5a3ce2c28b55b0af330d # v0.2.1
+        with:
+          config: '@807a544b7e55a9224b2b3780e636467bd4b5b99b' # v0.5.0
+
+      # Harden the runner with the just-loaded allow-list.
+      - name: "Harden runner (block)"
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Checkout repository"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: "Create minimal project fixtures"
+        shell: bash
+        run: |
+          # Create minimal project fixtures
+          mkdir -p auth-project
+          # The package name reaches npm during the dry runs below,
+          # which query the registry for an existing version. An
+          # obvious name like 'auth-project' could be registered by
+          # anyone and would then fail CI without a code change, so
+          # use one nobody is plausibly going to claim.
+          printf '%s\n' \
+            '{"name": "lfreleng-node-publish-action-test-fixture",' \
+            ' "version": "1.0.0"}' \
+            > auth-project/package.json
+          jq -e . auth-project/package.json > /dev/null
+          # Fixture for the token pass-through case, kept separate so
+          # the .npmrc written into it belongs to that case alone
+          mkdir -p token-project
+          printf '%s\n' \
+            '{"name": "token-project", "version": "1.0.0"}' \
+            > token-project/package.json
+          jq -e . token-project/package.json > /dev/null
+
+      # Ambiguous credentials must fail rather than silently pick one.
+      # The token below is a test literal, not a real credential.
+      #
+      # These conflict cases run in dry-run mode, so the validation
+      # branch under test is the only thing standing between the
+      # invocation and success. Dry-run mode skips the credential
+      # steps, so if validation stopped rejecting these they would
+      # succeed rather than fail for some unrelated reason.
+      - name: "Token plus password [expected failure]"
+        id: token-and-password
+        continue-on-error: true
+        uses: ./
+        with:
+          path_prefix: auth-project
+          publish_version: '1.0.0'
+          registry_url: 'https://registry.npmjs.org/'
+          auth_token: 'npm_testTOKEN0123456789abcdefGHIJKLM'
+          nexus_password: 'testpass'
+          dry_run: 'true'
+
+      # Basic auth has two routes into the mode counter, and only one
+      # of them is a password. Without this case, removing the
+      # INPUT_LOAD_CREDENTIAL half of that condition would leave
+      # every other test green while two credential modes were
+      # accepted at once.
+      #
+      # Dry-run mode also skips the vault_mapping_json and
+      # op_service_account_token requirement, so nothing but the mode
+      # conflict can fail this.
+      - name: "Token plus load_credential [expected failure]"
+        id: token-and-load
+        continue-on-error: true
+        uses: ./
+        with:
+          path_prefix: auth-project
+          publish_version: '1.0.0'
+          registry_url: 'https://registry.npmjs.org/'
+          auth_token: 'npm_testTOKEN0123456789abcdefGHIJKLM'
+          load_credential: 'true'
+          dry_run: 'true'
+
+      # Every other auth_token case is rejected during validation, so
+      # nothing exercises the pass-through to node-create-npmrc-action
+      # on a valid configuration: a typo in that forwarding would
+      # leave CI green while token publishing was broken.
+      #
+      # This case authenticates for real and then fails at the
+      # publish, because the registry host does not exist (.invalid is
+      # reserved by RFC 2606, so it resolves nowhere and the harden
+      # step blocks it regardless). The failure is the point: the
+      # .npmrc is written before the publish is attempted, and the
+      # scrub runs as a post-job step, so the file is still on disk
+      # for the assertion below.
+      - name: "Token auth writes an authenticated .npmrc"
+        id: token-npmrc
+        continue-on-error: true
+        uses: ./
+        with:
+          path_prefix: token-project
+          publish_version: '1.0.0'
+          registry_url: 'https://registry.example.invalid/'
+          auth_token: 'npm_testTOKEN0123456789abcdefGHIJKLM'
+          # nexus_user carries no secret and selects no mode, so it
+          # must not conflict with token auth -- callers computing it
+          # unconditionally across a Nexus/npmjs matrix depend on
+          # that. Supplying it here keeps the exception covered.
+          nexus_user: 'testuser'
+
+      - name: "Verify the token reached the .npmrc"
+        shell: bash
+        run: |
+          # Verify the token reached the .npmrc
+          errors=0
+          # Compare the complete line rather than just the key.
+          # Asserting that '_authToken=' appears somewhere would
+          # still pass if the forwarding picked up the wrong input --
+          # nexus_user is deliberately non-empty in this case, so a
+          # mix-up would produce a plausible-looking entry. grep -qxF
+          # keeps the value out of the log: the token is a test
+          # literal, but printing credential material in CI output is
+          # a bad habit to encode in a test.
+          want='//registry.example.invalid/:_authToken='
+          want="${want}npm_testTOKEN0123456789abcdefGHIJKLM"
+          if [ ! -f token-project/.npmrc ]; then
+            echo "Token auth wrote no .npmrc ❌"
+            errors=1
+          elif ! grep -qxF -- "${want}" token-project/.npmrc; then
+            echo "The .npmrc carries no _authToken line holding the" \
+              "token that was supplied ❌"
+            errors=1
+          fi
+          # A password entry would mean the wrong mode was selected
+          if [ -f token-project/.npmrc ] && \
+            grep -q '_auth=' token-project/.npmrc; then
+            echo "Token auth wrote a Basic auth entry ❌"
+            errors=1
+          fi
+          if [ "${errors}" != "0" ]; then
+            echo "Token pass-through test failed ❌" \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Token reached the generated .npmrc ✅"
+          echo "Token reached the generated .npmrc ✅" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - name: "Verify nexus_user never conflicts with a mode"
+        shell: bash
+        run: |
+          # Verify nexus_user never conflicts with a mode
+          # The token case above supplied nexus_user too. It reached
+          # the .npmrc step, so the username was accepted rather than
+          # rejected as a conflicting mode.
+          if [ ! -f token-project/.npmrc ]; then
+            echo "token plus nexus_user was rejected ❌"
+            echo "nexus_user exception test failed ❌" \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "nexus_user accepted alongside token auth ✅"
+          echo "nexus_user accepted alongside token auth ✅" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      # Accepting the username is only half the contract. The action
+      # also promises to *say* it had no effect, and callers that
+      # compute nexus_user across a mixed Nexus/npmjs matrix rely on
+      # that notice to tell the two legs apart. Nothing above asserts
+      # it, so deleting the notice would leave CI green.
+      #
+      # The validate step body is extracted from action.yaml and run
+      # directly: a composite action's own log lines are not
+      # available to a later step, so the notice cannot be observed
+      # from the invocations above.
+      - name: "Verify nexus_user is reported as ignored"
+        shell: bash
+        run: |
+          # Verify nexus_user is reported as ignored
+          validate="${RUNNER_TEMP}/validate.sh"
+          python3 -c "import yaml,sys; \
+            d=yaml.safe_load(open('action.yaml')); \
+            m=[x for x in d['runs']['steps'] \
+               if x.get('name') == 'Validate inputs']; \
+            sys.exit('validate step not found') if not m \
+            else sys.stdout.write(m[0]['run'])" > "${validate}"
+          # Fail loudly rather than silently testing nothing if the
+          # step is renamed
+          if ! grep -q 'conflicting authentication modes' \
+            "${validate}"; then
+            echo "Could not extract the validate step ❌"
+            echo "Update the extraction in this job to match"
+            exit 1
+          fi
+          root="${RUNNER_TEMP}/noticetest"
+          rm -rf "${root}"
+          mkdir -p "${root}/proj"
+          printf '%s\n' \
+            '{"name": "notice-fixture", "version": "1.0.0"}' \
+            > "${root}/proj/package.json"
+          # $1 nexus_user, $2 nexus_password, $3 auth_token
+          run_validate() {
+            env \
+              GITHUB_WORKSPACE="${root}" \
+              GITHUB_OUTPUT="${root}/gh_output" \
+              INPUT_PUBLISH_VERSION='1.0.0' \
+              INPUT_REGISTRY_URL='https://registry.npmjs.org/' \
+              INPUT_DRY_RUN='false' \
+              INPUT_PATH_PREFIX='proj' \
+              INPUT_NODE_VERSION='22' \
+              INPUT_NODE_VERSION_FILE='' \
+              INPUT_TAG='latest' \
+              INPUT_ACCESS='' \
+              INPUT_PROVENANCE='false' \
+              INPUT_LOAD_CREDENTIAL='false' \
+              INPUT_NEXUS_USER="$1" \
+              INPUT_NEXUS_PASSWORD="$2" \
+              INPUT_AUTH_TOKEN="$3" \
+              INPUT_VAULT_MAPPING_JSON='' \
+              INPUT_OP_SERVICE_ACCOUNT_TOKEN='' \
+              bash "${validate}" 2>&1
+          }
+          errors=0
+          # Token auth carries no username, so the notice must fire
+          if ! run_validate 'testuser' '' 'npm_testTOKEN0123' \
+            | grep -q '::notice::Ignoring nexus_user'; then
+            echo "No notice for nexus_user alongside token auth ❌"
+            errors=1
+          fi
+          # Basic auth uses the username, so the notice must not
+          # fire. Without this half a notice emitted unconditionally
+          # would pass, while telling Nexus callers their username
+          # was discarded.
+          if run_validate 'testuser' 'testpass' '' \
+            | grep -q 'Ignoring nexus_user'; then
+            echo "nexus_user reported as ignored under Basic auth ❌"
+            errors=1
+          fi
+          if [ "${errors}" != "0" ]; then
+            echo "nexus_user notice tests failed ❌" \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "nexus_user reported as ignored, and only when it is ✅"
+          echo "nexus_user reported as ignored, and only when it is ✅" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - name: "Verify every invalid combination was rejected"
+        shell: bash
+        env:
+          TOKEN_AND_PASSWORD: ${{ steps.token-and-password.outcome }}
+          TOKEN_AND_LOAD: ${{ steps.token-and-load.outcome }}
+        run: |
+          # Verify every invalid combination was rejected
+          errors=0
+          for pair in \
+            "token+password:${TOKEN_AND_PASSWORD}" \
+            "token+load_credential:${TOKEN_AND_LOAD}"; do
+            name="${pair%%:*}"
+            outcome="${pair##*:}"
+            if [ "${outcome}" != "failure" ]; then
+              echo "Combination '${name}' was accepted ❌"
+              errors=1
+            fi
+          done
+          if [ "${errors}" != "0" ]; then
+            echo "Authentication mode tests failed ❌" \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Invalid authentication modes correctly rejected ✅"
+          echo "Invalid authentication modes correctly rejected ✅" \
+            >> "$GITHUB_STEP_SUMMARY"
