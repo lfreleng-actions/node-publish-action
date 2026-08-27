@@ -57,7 +57,7 @@ jobs:
       # organisation's .github repository and publish it as
       # $CONNECTION_ALLOW_LIST for the harden-runner step below.
       # yamllint disable-line rule:line-length
-      - uses: lfreleng-actions/harden-runner-block-action@6db537b3e6d060c3287c5a3ce2c28b55b0af330d # v0.2.1
+      - uses: lfreleng-actions/harden-runner-block-action@2a70c3284392b8d6ee85a509dd4e9818801a7e82 # v0.11.1
         with:
           config: '@807a544b7e55a9224b2b3780e636467bd4b5b99b' # v0.5.0
 
@@ -162,7 +162,7 @@ jobs:
       # organisation's .github repository and publish it as
       # $CONNECTION_ALLOW_LIST for the harden-runner step below.
       # yamllint disable-line rule:line-length
-      - uses: lfreleng-actions/harden-runner-block-action@6db537b3e6d060c3287c5a3ce2c28b55b0af330d # v0.2.1
+      - uses: lfreleng-actions/harden-runner-block-action@2a70c3284392b8d6ee85a509dd4e9818801a7e82 # v0.11.1
         with:
           config: '@807a544b7e55a9224b2b3780e636467bd4b5b99b' # v0.5.0
 
@@ -316,7 +316,7 @@ jobs:
       # organisation's .github repository and publish it as
       # $CONNECTION_ALLOW_LIST for the harden-runner step below.
       # yamllint disable-line rule:line-length
-      - uses: lfreleng-actions/harden-runner-block-action@6db537b3e6d060c3287c5a3ce2c28b55b0af330d # v0.2.1
+      - uses: lfreleng-actions/harden-runner-block-action@2a70c3284392b8d6ee85a509dd4e9818801a7e82 # v0.11.1
         with:
           config: '@807a544b7e55a9224b2b3780e636467bd4b5b99b' # v0.5.0
 
