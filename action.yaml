@@ -27,7 +27,7 @@ inputs:
     default: ""
   dry_run:
     # yamllint disable-line rule:line-length
-    description: "Pack and verify without registry interaction ('true'/'false'); skips credential setup"
+    description: "Pack and verify without publishing ('true'/'false'); npm may still read the registry; skips credential setup"
     required: false
     default: "false"
   path_prefix:
@@ -59,14 +59,22 @@ inputs:
     required: false
     default: "false"
   # Credential pass-through for node-create-npmrc-action (unused in
-  # dry-run mode)
+  # dry-run mode). Two mutually exclusive authentication modes:
+  # Basic auth (nexus_user/nexus_password or load_credential), or a
+  # bearer token (auth_token).
   nexus_user:
-    description: "Registry username (default: calling repository name)"
+    # yamllint disable-line rule:line-length
+    description: "Basic auth username (default: calling repository name); ignored when auth_token selects token authentication"
     required: false
     default: ""
   nexus_password:
     # yamllint disable-line rule:line-length
     description: "Registry password/token; required for non-dry-run publishes unless load_credential is 'true'"
+    required: false
+    default: ""
+  auth_token:
+    # yamllint disable-line rule:line-length
+    description: "Bearer token written as '_authToken'; use for registries that reject Basic auth (for example registry.npmjs.org). Excludes nexus_password and load_credential; nexus_user is ignored"
     required: false
     default: ""
   load_credential:
@@ -117,21 +125,49 @@ runs:
         INPUT_ACCESS: ${{ inputs.access }}
         INPUT_PROVENANCE: ${{ inputs.provenance }}
         INPUT_LOAD_CREDENTIAL: ${{ inputs.load_credential }}
+        INPUT_NEXUS_USER: ${{ inputs.nexus_user }}
         INPUT_NEXUS_PASSWORD: ${{ inputs.nexus_password }}
+        INPUT_AUTH_TOKEN: ${{ inputs.auth_token }}
         INPUT_VAULT_MAPPING_JSON: ${{ inputs.vault_mapping_json }}
         INPUT_OP_SERVICE_ACCOUNT_TOKEN: ${{ inputs.op_service_account_token }}
       run: |
         # Validate inputs
         # Preflight: fail with a clear message when required tools are
         # missing (possible on minimal self-hosted runners)
-        for tool in jq realpath mktemp; do
+        for tool in jq realpath mktemp tr; do
           if ! command -v "${tool}" > /dev/null 2>&1; then
             echo "Error: required tool not found: ${tool} ❌"
-            echo "This action requires jq, realpath (GNU coreutils)"
-            echo "and mktemp on the runner"
+            echo "This action requires jq, realpath (GNU coreutils,"
+            echo "including -m), mktemp and tr on the runner"
             exit 1
           fi
         done
+        # A workspace selector is at odds with this action's
+        # contract: it publishes the single package at path_prefix,
+        # verifies one version and reports one result. A selector can
+        # match several packages, and npm would publish them all
+        # before anything here could object -- irreversibly. Reject
+        # it up front and point at the input that expresses the same
+        # intent unambiguously.
+        #
+        # npm matches the npm_config_ prefix case insensitively, so
+        # fold before comparing.
+        while IFS= read -r env_name; do
+          case "$(printf '%s' "${env_name}" \
+            | tr '[:upper:]' '[:lower:]')" in
+            npm_config_workspace)
+              # npm's loadEnv skips empty values outright, so an
+              # exported but empty selector selects nothing and must
+              # not be treated as one.
+              if [ -n "${!env_name}" ]; then
+                echo "Error: a workspace is selected through" \
+                  "${env_name} ❌"
+                echo "This action publishes one package. Point"
+                echo "path_prefix at the workspace package instead."
+                exit 1
+              fi ;;
+          esac
+        done < <(compgen -e)
         # The action requires GNU realpath -m (missing-path
         # resolution); BSD/macOS realpath lacks it, and failing here
         # gives a clearer error than a mid-run failure
@@ -221,7 +257,7 @@ runs:
           esac
         done
         # The registry URL is mandatory for real publishes; dry-run
-        # mode performs no registry interaction. Validate any provided
+        # mode publishes nothing, so it needs none. Validate any provided
         # value: https scheme, trailing slash, non-empty host and a
         # character allowlist that excludes whitespace, userinfo
         # separators and shell metacharacters
@@ -251,16 +287,43 @@ runs:
               exit 1 ;;
           esac
         fi
+        # Exactly one authentication mode. Basic auth folds a
+        # password into an .npmrc entry and token auth writes a
+        # bearer token, so accepting both would leave the effective
+        # credential ambiguous.
+        modes=0
+        if [ -n "${INPUT_AUTH_TOKEN}" ]; then
+          modes=$((modes + 1))
+        fi
+        if [ "${INPUT_LOAD_CREDENTIAL}" = "true" ] || \
+          [ -n "${INPUT_NEXUS_PASSWORD}" ]; then
+          modes=$((modes + 1))
+        fi
+        if [ "${modes}" -gt 1 ]; then
+          echo "Error: conflicting authentication modes ❌"
+          echo "Choose one of: auth_token, or Basic auth"
+          echo "(nexus_password or load_credential)"
+          exit 1
+        fi
         # Real publishes need a credential source; failing here gives
         # a clearer error than a mid-publish authentication failure
-        if [ "${INPUT_DRY_RUN}" != "true" ] && \
-          [ "${INPUT_LOAD_CREDENTIAL}" != "true" ] && \
-          [ -z "${INPUT_NEXUS_PASSWORD}" ]; then
+        if [ "${INPUT_DRY_RUN}" != "true" ] && [ "${modes}" -eq 0 ]; then
           echo "Error: no registry credential configured ❌"
-          echo "Provide nexus_password, or set load_credential to"
-          echo "'true' (with vault_mapping_json and"
-          echo "op_service_account_token)"
+          echo "Provide nexus_password, set load_credential to 'true'"
+          echo "(with vault_mapping_json and"
+          echo "op_service_account_token), or provide auth_token"
           exit 1
+        fi
+        # nexus_user is a Basic auth username and carries no secret,
+        # so it does not select a mode and does not conflict with
+        # one. Callers computing it unconditionally (matrix publishes
+        # that mix Nexus and npmjs targets) would break if this
+        # rejected, so say it is ignored rather than fail.
+        if [ -n "${INPUT_NEXUS_USER}" ] && \
+          [ -n "${INPUT_AUTH_TOKEN}" ]; then
+          echo "::notice::Ignoring nexus_user: it applies to Basic" \
+            "auth, and this publish uses token authentication," \
+            "which carries no username."
         fi
         # load_credential needs both companion inputs; check
         # empty/non-empty alone and never echo the values (secrets)
@@ -396,18 +459,19 @@ runs:
         node-version: ${{ steps.validate.outputs.node_version }}
         node-version-file: ${{ steps.validate.outputs.node_version_file }}
 
-    # Dry-run mode performs no registry interaction, so it skips the
-    # credential machinery entirely. For real publishes the npmrc
-    # action writes the authenticated .npmrc and registers a
-    # guaranteed post-job step that scrubs it again
+    # Dry-run mode performs no publish and sets up no credential, so
+    # it skips the credential machinery entirely. For real publishes
+    # the npmrc action writes the authenticated .npmrc and registers
+    # a guaranteed post-job step that scrubs it again
     - name: "Create authenticated .npmrc"
       if: inputs.dry_run != 'true'
       # yamllint disable-line rule:line-length
-      uses: lfreleng-actions/node-create-npmrc-action@ec0cc1fa52dea5205897d0e3b25dfaf4ebe095fe # v0.1.2
+      uses: lfreleng-actions/node-create-npmrc-action@e0ff8adfc0591c86d8d07828bffab10f43096155 # v0.2.0
       with:
         registry_url: ${{ inputs.registry_url }}
         nexus_user: ${{ inputs.nexus_user }}
         nexus_password: ${{ inputs.nexus_password }}
+        auth_token: ${{ inputs.auth_token }}
         load_credential: ${{ inputs.load_credential }}
         vault_mapping_json: ${{ inputs.vault_mapping_json }}
         op_service_account_token: ${{ inputs.op_service_account_token }}
@@ -487,8 +551,38 @@ runs:
         # dependencies before stamping, so a preversion/version hook
         # invoking the test or build script cannot succeed. Both
         # lanes suppress them, so the two produce the same tree.
-        npm version "${PUBLISH_VERSION}" --no-git-tag-version \
-          --allow-same-version --ignore-scripts
+        #
+        # --no-workspaces because 'npm version' is workspace aware
+        # too, and runs before the publish. With workspaces enabled
+        # in configuration it stamps every workspace package and
+        # leaves this one alone -- rewriting sibling manifests that
+        # were never part of this publish.
+        #
+        # A workspace *selector* in an .npmrc conflicts with the flag
+        # rather than being overridden by it, and npm reports that
+        # nothing here can detect in advance: the selection appears
+        # in neither 'npm config get workspace' nor 'npm config
+        # list'. Failing at the stamp is the safe side -- nothing has
+        # published yet -- so keep npm's message and add the remedy.
+        set +e
+        stamp_out="$(npm version "${PUBLISH_VERSION}" \
+          --no-git-tag-version --allow-same-version \
+          --ignore-scripts --no-workspaces 2>&1)"
+        stamp_rc=$?
+        set -e
+        if [ "${stamp_rc}" != "0" ]; then
+          printf '%s\n' "${stamp_out}"
+          case "${stamp_out}" in
+            *'--no-workspaces and --workspace'*)
+              echo "Error: a workspace is selected in npm" \
+                "configuration ❌"
+              echo "This action publishes one package, so it stamps"
+              echo "and publishes with workspaces disabled. Remove"
+              echo "the workspace setting and point path_prefix at"
+              echo "the package instead." ;;
+          esac
+          exit 1
+        fi
         stamped="$(jq -r '.version // empty' package.json)"
         if [ "${stamped}" != "${PUBLISH_VERSION}" ]; then
           echo "Error: version stamp verification failed ❌"
@@ -545,6 +639,16 @@ runs:
         # Build the publish arguments from validated inputs; every
         # value passed a whole-string allowlist in the validate step
         set -- publish --json --tag "${TAG}"
+        # This action publishes the single package at path_prefix.
+        # With workspaces enabled through configuration, npm would
+        # fan out and emit one metadata entry per package, while the
+        # parse below takes a single object -- so several packages
+        # would publish and only one would be verified and reported.
+        #
+        # Unconditional: validate rejects an npm_config_workspace
+        # selection, which is the only source npm refuses alongside
+        # this flag, so the two cannot conflict.
+        set -- "$@" --no-workspaces
         if [ -n "${ACCESS}" ]; then
           set -- "$@" --access "${ACCESS}"
         fi
@@ -553,7 +657,8 @@ runs:
         fi
         if [ "${DRY_RUN}" = "true" ]; then
           set -- "$@" --dry-run
-          echo "Publishing in dry-run mode (no registry interaction)"
+          echo "Publishing in dry-run mode (packs and reports only;" \
+            "npm performs no publish)"
         else
           set -- "$@" --registry "${REGISTRY_URL}"
         fi
@@ -569,13 +674,51 @@ runs:
         fi
 
         # The --json output carries the publish metadata; verify it
-        # matches the requested version before emitting outputs
-        package_name="$(jq -r '.name // empty' \
+        # matches the requested version before emitting outputs.
+        #
+        # Enforce the singular contract on the result rather than
+        # trusting the flag alone: an explicit workspace selection
+        # skips it, and npm could fan out. Reporting one package
+        # while several reached the registry is the failure worth
+        # preventing.
+        entry_count="$(jq -r 'if (.name | type) == "string"
+          then 1 else (to_entries | length) end' \
+          "${scratch_dir}/publish.json" 2>/dev/null || echo 1)"
+        # Only fan-out is an error here. An empty object falls
+        # through to the metadata checks below, which report the
+        # missing fields more usefully than a count would.
+        case "${entry_count}" in
+          ''|0|1) ;;
+          *)
+            echo "::error::npm published ${entry_count} packages," \
+              "but this action verifies and reports one. Publish" \
+              "each workspace package with its own path_prefix" \
+              "rather than selecting several at once."
+            exit 1 ;;
+        esac
+        #
+        # npm 11 keys that object by package name, where npm 10 put
+        # the fields at the top level. Reading the top level on npm
+        # 11 returns empty for every field, so the action aborts --
+        # after the package has already reached the registry.
+        # Normalise to the inner object so both shapes parse, rather
+        # than pinning this action to an npm generation.
+        #
+        # Select on the type of .name rather than its presence. A
+        # package legitimately named "name" produces {"name": {...}}
+        # under npm 11, which a presence test reads as the npm 10
+        # flat shape and hands back the metadata object as the
+        # package name -- failing the publish after it succeeded.
+        # Under npm 10 .name is a string; under npm 11 it is either
+        # absent or the nested object.
+        meta="$(jq -c 'if (.name | type) == "string" then .
+          else (to_entries | .[0].value // {}) end' \
           "${scratch_dir}/publish.json")"
-        published_version="$(jq -r '.version // empty' \
-          "${scratch_dir}/publish.json")"
-        tarball_name="$(jq -r '.filename // empty' \
-          "${scratch_dir}/publish.json")"
+        package_name="$(printf '%s' "${meta}" | jq -r '.name // empty')"
+        published_version="$(printf '%s' "${meta}" \
+          | jq -r '.version // empty')"
+        tarball_name="$(printf '%s' "${meta}" \
+          | jq -r '.filename // empty')"
         # Constrain the reported name to the npm package name
         # character set before further use in commands and logs
         case "${package_name}" in
@@ -623,7 +766,7 @@ runs:
           echo "## 🚀 Node.js Package Publish"
           echo ""
           if [ "${DRY_RUN}" = "true" ]; then
-            echo "**Mode:** dry run (no registry interaction)"
+            echo "**Mode:** dry run (packs and reports only)"
           else
             echo "**Mode:** publish"
             echo "**Registry:** ${REGISTRY_URL}"

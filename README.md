@@ -51,35 +51,36 @@ steps:
 ## Requirements
 
 The action needs `jq`, `realpath` (GNU coreutils, including `-m`
-support) and `mktemp` on the runner. GitHub-hosted Ubuntu runners
-include these tools; minimal self-hosted or non-Linux runners must
-provide them. The action checks for them up front and fails with a
-clear error naming any missing tool. It installs Node.js and npm via
+support), `mktemp` and `tr` on the runner. GitHub-hosted Ubuntu
+runners include these tools; minimal self-hosted or non-Linux runners
+must provide them. The action checks for them up front and fails with
+a clear error naming any missing tool. It installs Node.js and npm via
 the pinned `actions/setup-node` action, without dependency caching.
 Real publishes need egress to the target registry; dry-run mode
-performs no registry interaction.
+publishes nothing and writes no credential.
 
 ## Inputs
 
 <!-- markdownlint-disable MD013 -->
 
-| Name                     | Required | Default  | Description                                                                          |
-| ------------------------ | -------- | -------- | ------------------------------------------------------------------------------------ |
-| publish_version          | True     |          | Version to stamp and publish, such as `1.2.3` or `1.2.3-SNAPSHOT`                    |
-| registry_url             | False    | `''`     | Target npm registry URL ending with `/`; required unless `dry_run` is `'true'`       |
-| dry_run                  | False    | `false`  | Pack and verify without registry interaction; skips credential setup                 |
-| path_prefix              | False    | `.`      | Project directory; must resolve within the workspace                                 |
-| node_version             | False    | `22`     | Node.js version to set up, such as `22`, `22.x` or `lts/*`                           |
-| node_version_file        | False    | `''`     | File containing the Node.js version, such as `.nvmrc`; overrides `node_version`      |
-| tag                      | False    | `latest` | npm distribution tag                                                                 |
-| access                   | False    | `''`     | Package access: `public`, `restricted` or unset                                      |
-| provenance               | False    | `false`  | Generate registry-native provenance; needs registry and OIDC support                 |
-| nexus_user               | False    | `''`     | Registry username (default: calling repository name)                                 |
-| nexus_password           | False    | `''`     | Registry password/token; required for real publishes unless `load_credential`        |
-| load_credential          | False    | `false`  | Fetch the password from 1Password via credential-load-action                         |
-| vault_mapping_json       | False    | `''`     | JSON mapping repository owner to 1Password vault (with `load_credential`)            |
-| op_service_account_token | False    | `''`     | 1Password service account token (with `load_credential`)                             |
-| scope                    | False    | `''`     | npm scope for the auth entry (for example `@onap`)                                   |
+| Name                     | Required | Default  | Description                                                                                  |
+| ------------------------ | -------- | -------- | -------------------------------------------------------------------------------------------- |
+| publish_version          | True     |          | Version to stamp and publish, such as `1.2.3` or `1.2.3-SNAPSHOT`                            |
+| registry_url             | False    | `''`     | Target npm registry URL ending with `/`; required unless `dry_run` is `'true'`               |
+| dry_run                  | False    | `false`  | Pack and verify without publishing (npm may still read the registry); skips credential setup |
+| path_prefix              | False    | `.`      | Project directory; must resolve within the workspace                                         |
+| node_version             | False    | `22`     | Node.js version to set up, such as `22`, `22.x` or `lts/*`                                   |
+| node_version_file        | False    | `''`     | File containing the Node.js version, such as `.nvmrc`; overrides `node_version`              |
+| tag                      | False    | `latest` | npm distribution tag                                                                         |
+| access                   | False    | `''`     | Package access: `public`, `restricted` or unset                                              |
+| provenance               | False    | `false`  | Generate registry-native provenance; needs registry and OIDC support                         |
+| nexus_user               | False    | `''`     | Basic auth username (default: calling repository name); ignored by token auth                |
+| nexus_password           | False    | `''`     | Registry password for Basic auth; required for real publishes unless another mode            |
+| auth_token               | False    | `''`     | Bearer token written as `_authToken`; for registries rejecting Basic auth                    |
+| load_credential          | False    | `false`  | Fetch the password from 1Password via credential-load-action                                 |
+| vault_mapping_json       | False    | `''`     | JSON mapping repository owner to 1Password vault (with `load_credential`)                    |
+| op_service_account_token | False    | `''`     | 1Password service account token (with `load_credential`)                                     |
+| scope                    | False    | `''`     | npm scope for the auth entry (for example `@onap`)                                           |
 
 <!-- markdownlint-enable MD013 -->
 
@@ -125,13 +126,15 @@ The `nexus_user`, `scope` and credential inputs pass through to
 2. **Authenticate** (real publishes): `node-create-npmrc-action`
    writes an authenticated `.npmrc` into the project directory
 3. **Stamp**: `npm version <X> --no-git-tag-version
-   --allow-same-version --ignore-scripts` updates `package.json`,
-   with the result read back and verified. A `::notice::` names any
-   `preversion`/`version`/`postversion` scripts the project defines,
-   since `--ignore-scripts` means they do not run
-4. **Publish**: `npm publish --json` with the configured tag, access
-   and provenance flags; the action parses the JSON metadata and
-   verifies the published version matches the request
+   --allow-same-version --ignore-scripts --no-workspaces` updates
+   `package.json`, with the result read back and verified. A
+   `::notice::` names any `preversion`/`version`/`postversion`
+   scripts the project defines, since `--ignore-scripts` means they
+   do not run
+4. **Publish**: `npm publish --json --no-workspaces` with the
+   configured tag, access and provenance flags; the action parses the
+   JSON metadata and verifies the published version matches the
+   request
 5. **Verify** (real publishes): `npm view <name>@<version>` against
    the target registry confirms availability; an unreadable package
    downgrades to a warning (registries may restrict anonymous reads
@@ -141,21 +144,80 @@ The `nexus_user`, `scope` and credential inputs pass through to
 ## Dry-Run Mode
 
 With `dry_run: 'true'` the action runs `npm publish --dry-run`, which
-packs the package and reports the metadata without any registry
-interaction. Dry-run mode skips the `.npmrc`/credential steps
-entirely, so it needs no `registry_url` and no credential inputs.
-Every test in this repository's testing workflow runs in dry-run
-mode; CI holds no registry credentials.
+packs the package and reports the metadata without publishing. npm
+may still consult the registry while doing so. Dry-run mode skips the
+`.npmrc`/credential steps entirely, so it needs no `registry_url` and
+no credential inputs.
+
+CI holds no registry credentials and completes no publish, so the
+testing workflow uses dry-run mode wherever the path under test
+allows it. One case cannot: the token pass-through test inspects the
+generated `.npmrc`, which dry-run mode never writes, and then fails
+against a registry host that does not exist.
+
+## Authentication Modes
+
+Two mutually exclusive modes. Supplying both fails the action rather
+than picking a winner, since the effective credential would otherwise
+be ambiguous.
+
+### Basic auth (Nexus)
+
+Pass `nexus_password` directly, or set `load_credential: 'true'` with
+`vault_mapping_json` and `op_service_account_token` to fetch it from
+1Password. `node-create-npmrc-action` writes an `_auth` entry holding
+`base64(username:password)`.
+
+### Bearer token
+
+Pass `auth_token`. Written as an `_authToken` entry. Registries that
+reject Basic auth for publishing, notably `registry.npmjs.org`,
+require this form.
+
+`nexus_user` plays no part in token publishing, since a bearer token
+carries no username. Setting it alongside `auth_token` is inert
+rather than an error — callers that compute it unconditionally, such
+as a matrix publishing to both Nexus and npmjs.org, would otherwise
+have to strip it per target. The action emits a `::notice::` naming
+it as ignored.
+
+> [!NOTE]
+> OIDC trusted publishing, which stores no credential at all, is
+> tracked separately in
+> [issue #28](https://github.com/lfreleng-actions/node-publish-action/issues/28).
+
+## Workspaces
+
+This action publishes the single package at `path_prefix`. Both
+`npm version` and `npm publish` are workspace aware, so the action
+passes `--no-workspaces` to each: without it, stamping rewrites every
+*sibling* manifest and leaves the target at its committed version,
+and publishing fans out across the whole workspace while the action
+verifies and reports a single package.
+
+To publish more than one workspace package, call the action once per
+package with its own `path_prefix`.
+
+A workspace selected through `npm_config_workspace` fails validation.
+One selected through a `workspace=` entry in an `.npmrc` fails at the
+stamp instead, before anything reaches the registry: npm exposes such
+a selection through neither `npm config get workspace` nor `npm config
+list`, so nothing can catch it earlier.
+
+Which `.npmrc` holds that entry changes when it applies. For real
+publishes the credential step writes the project `.npmrc` before the
+stamp runs, truncating whatever it replaces, so a project-level
+selector never survives to affect the publish. A selector at any
+other config level — the user `~/.npmrc`, for instance — does
+survive, and stops the run at the stamp. Dry runs skip the credential
+step, so a project-level selector reaches the stamp there too.
 
 ## Credential Handling
 
 `node-create-npmrc-action` masks the credential material, writes the
 `.npmrc` with restrictive permissions and registers a guaranteed
 post-job step that scrubs the file again — including when later steps
-fail. This action adds no duplicate cleanup logic. Credential supply
-follows the organisation's model: pass `nexus_password` directly, or
-set `load_credential: 'true'` with `vault_mapping_json` and
-`op_service_account_token` to fetch the password from 1Password.
+fail. This action adds no duplicate cleanup logic.
 
 ## Provenance
 
