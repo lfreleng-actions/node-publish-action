@@ -124,14 +124,40 @@ runs:
         # Validate inputs
         # Preflight: fail with a clear message when required tools are
         # missing (possible on minimal self-hosted runners)
-        for tool in jq realpath mktemp; do
+        for tool in jq realpath mktemp tr; do
           if ! command -v "${tool}" > /dev/null 2>&1; then
             echo "Error: required tool not found: ${tool} ❌"
-            echo "This action requires jq, realpath (GNU coreutils)"
-            echo "and mktemp on the runner"
+            echo "This action requires jq, realpath (GNU coreutils,"
+            echo "including -m), mktemp and tr on the runner"
             exit 1
           fi
         done
+        # A workspace selector is at odds with this action's
+        # contract: it publishes the single package at path_prefix,
+        # verifies one version and reports one result. A selector can
+        # match several packages, and npm would publish them all
+        # before anything here could object -- irreversibly. Reject
+        # it up front and point at the input that expresses the same
+        # intent unambiguously.
+        #
+        # npm matches the npm_config_ prefix case insensitively, so
+        # fold before comparing.
+        while IFS= read -r env_name; do
+          case "$(printf '%s' "${env_name}" \
+            | tr '[:upper:]' '[:lower:]')" in
+            npm_config_workspace)
+              # npm's loadEnv skips empty values outright, so an
+              # exported but empty selector selects nothing and must
+              # not be treated as one.
+              if [ -n "${!env_name}" ]; then
+                echo "Error: a workspace is selected through" \
+                  "${env_name} ❌"
+                echo "This action publishes one package. Point"
+                echo "path_prefix at the workspace package instead."
+                exit 1
+              fi ;;
+          esac
+        done < <(compgen -e)
         # The action requires GNU realpath -m (missing-path
         # resolution); BSD/macOS realpath lacks it, and failing here
         # gives a clearer error than a mid-run failure
@@ -487,8 +513,38 @@ runs:
         # dependencies before stamping, so a preversion/version hook
         # invoking the test or build script cannot succeed. Both
         # lanes suppress them, so the two produce the same tree.
-        npm version "${PUBLISH_VERSION}" --no-git-tag-version \
-          --allow-same-version --ignore-scripts
+        #
+        # --no-workspaces because 'npm version' is workspace aware
+        # too, and runs before the publish. With workspaces enabled
+        # in configuration it stamps every workspace package and
+        # leaves this one alone -- rewriting sibling manifests that
+        # were never part of this publish.
+        #
+        # A workspace *selector* in an .npmrc conflicts with the flag
+        # rather than being overridden by it, and npm reports that
+        # nothing here can detect in advance: the selection appears
+        # in neither 'npm config get workspace' nor 'npm config
+        # list'. Failing at the stamp is the safe side -- nothing has
+        # published yet -- so keep npm's message and add the remedy.
+        set +e
+        stamp_out="$(npm version "${PUBLISH_VERSION}" \
+          --no-git-tag-version --allow-same-version \
+          --ignore-scripts --no-workspaces 2>&1)"
+        stamp_rc=$?
+        set -e
+        if [ "${stamp_rc}" != "0" ]; then
+          printf '%s\n' "${stamp_out}"
+          case "${stamp_out}" in
+            *'--no-workspaces and --workspace'*)
+              echo "Error: a workspace is selected in npm" \
+                "configuration ❌"
+              echo "This action publishes one package, so it stamps"
+              echo "and publishes with workspaces disabled. Remove"
+              echo "the workspace setting and point path_prefix at"
+              echo "the package instead." ;;
+          esac
+          exit 1
+        fi
         stamped="$(jq -r '.version // empty' package.json)"
         if [ "${stamped}" != "${PUBLISH_VERSION}" ]; then
           echo "Error: version stamp verification failed ❌"
@@ -545,6 +601,16 @@ runs:
         # Build the publish arguments from validated inputs; every
         # value passed a whole-string allowlist in the validate step
         set -- publish --json --tag "${TAG}"
+        # This action publishes the single package at path_prefix.
+        # With workspaces enabled through configuration, npm would
+        # fan out and emit one metadata entry per package, while the
+        # parse below takes a single object -- so several packages
+        # would publish and only one would be verified and reported.
+        #
+        # Unconditional: validate rejects an npm_config_workspace
+        # selection, which is the only source npm refuses alongside
+        # this flag, so the two cannot conflict.
+        set -- "$@" --no-workspaces
         if [ -n "${ACCESS}" ]; then
           set -- "$@" --access "${ACCESS}"
         fi
@@ -570,6 +636,27 @@ runs:
 
         # The --json output carries the publish metadata; verify it
         # matches the requested version before emitting outputs.
+        #
+        # Enforce the singular contract on the result rather than
+        # trusting the flag alone: an explicit workspace selection
+        # skips it, and npm could fan out. Reporting one package
+        # while several reached the registry is the failure worth
+        # preventing.
+        entry_count="$(jq -r 'if (.name | type) == "string"
+          then 1 else (to_entries | length) end' \
+          "${scratch_dir}/publish.json" 2>/dev/null || echo 1)"
+        # Only fan-out is an error here. An empty object falls
+        # through to the metadata checks below, which report the
+        # missing fields more usefully than a count would.
+        case "${entry_count}" in
+          ''|0|1) ;;
+          *)
+            echo "::error::npm published ${entry_count} packages," \
+              "but this action verifies and reports one. Publish" \
+              "each workspace package with its own path_prefix" \
+              "rather than selecting several at once."
+            exit 1 ;;
+        esac
         #
         # npm 11 keys that object by package name, where npm 10 put
         # the fields at the top level. Reading the top level on npm

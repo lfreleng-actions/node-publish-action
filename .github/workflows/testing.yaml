@@ -494,3 +494,371 @@ jobs:
           echo "Publish metadata normalisation correct ✅"
           echo "Publish metadata normalisation correct ✅" \
             >> "$GITHUB_STEP_SUMMARY"
+
+      # The fan-out guard sits beside the filter above and rejects a
+      # multi-entry result. test-workspace-publish cannot reach it:
+      # --no-workspaces stops npm producing more than one entry, so
+      # deleting the guard on its own leaves that job green. It is a
+      # backstop for the case where the flag is bypassed, which by
+      # definition no end-to-end fixture can create -- so drive it
+      # directly, over the shapes npm emits when it does fan out.
+      - name: "Exercise the workspace fan-out guard"
+        shell: bash
+        run: |
+          # Exercise the workspace fan-out guard
+          guard="${RUNNER_TEMP}/fanout.sh"
+          # shellcheck disable=SC2016  # a sed address, not a shell var
+          sed -n '/^        entry_count="\$(jq -r/,/^        esac$/p' \
+            action.yaml | sed 's/^        //' > "${guard}"
+          # Fail loudly rather than silently testing nothing if the
+          # block is renamed or reindented
+          if ! grep -q 'entry_count' "${guard}"; then
+            echo "Could not extract the fan-out guard ❌"
+            echo "Update the extraction in this job to match"
+            exit 1
+          fi
+          scratch_dir="${RUNNER_TEMP}/fanout"
+          rm -rf "${scratch_dir}"
+          mkdir -p "${scratch_dir}"
+          export scratch_dir
+          errors=0
+          # $1 case, $2 want (reject|allow), $3 publish.json body
+          check() {
+            printf '%s' "$3" > "${scratch_dir}/publish.json"
+            set +e
+            bash "${guard}" > /dev/null 2>&1
+            rc=$?
+            set -e
+            if [ "${rc}" != "0" ]; then
+              got='reject'
+            else
+              got='allow'
+            fi
+            if [ "${got}" != "$2" ]; then
+              echo "$1: guard returned ${got}, expected $2 ❌"
+              errors=1
+            fi
+          }
+          check 'npm10 flat single' allow \
+            '{"name":"pkg","version":"1.0.0"}'
+          check 'npm11 keyed single' allow '{"pkg":{"name":"pkg"}}'
+          # A package literally named 'name' is a single publish, not
+          # a fan-out; the type test has to hold here too
+          check 'npm11 package named name' allow \
+            '{"name":{"name":"name","version":"3.0.0"}}'
+          check 'two packages' reject \
+            '{"a":{"name":"a"},"b":{"name":"b"}}'
+          check 'three packages' reject \
+            '{"a":{},"b":{},"c":{}}'
+          # An empty object is not fan-out. It falls through to the
+          # metadata checks, which report the missing fields more
+          # usefully than a count would.
+          check 'empty object' allow '{}'
+          if [ "${errors}" != "0" ]; then
+            echo "Fan-out guard tests failed ❌" \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Fan-out guard rejects multi-package results ✅"
+          echo "Fan-out guard rejects multi-package results ✅" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+  ### Test that stamping never touches sibling workspace packages ###
+  # 'npm version' is workspace aware and runs before the publish, so
+  # with workspaces enabled in configuration it stamps every
+  # workspace package and leaves the target alone -- rewriting
+  # manifests that were never part of this publish. The stamp step is
+  # extracted from action.yaml and run against a workspace fixture.
+  test-workspace-stamp:
+    name: "Test: stamping ignores sibling workspace packages"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      # Load the egress allow-list out-of-band from the
+      # organisation's .github repository and publish it as
+      # $CONNECTION_ALLOW_LIST for the harden-runner step below.
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@6db537b3e6d060c3287c5a3ce2c28b55b0af330d # v0.2.1
+        with:
+          config: '@807a544b7e55a9224b2b3780e636467bd4b5b99b' # v0.5.0
+
+      # Harden the runner with the just-loaded allow-list.
+      - name: "Harden runner (block)"
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Checkout repository"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: "Setup Node.js"
+        # yamllint disable-line rule:line-length
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+
+      - name: "Stamp a workspace root and check the siblings"
+        shell: bash
+        run: |
+          # Stamp a workspace root and check the siblings
+          stamp="${RUNNER_TEMP}/stamp.sh"
+          python3 -c "import yaml,sys; \
+            d=yaml.safe_load(open('action.yaml')); \
+            m=[x for x in d['runs']['steps'] \
+               if x.get('name') == \
+               'Stamp version into package.json']; \
+            sys.exit('stamp step not found') if not m \
+            else sys.stdout.write(m[0]['run'])" > "${stamp}"
+          if ! grep -q 'no-workspaces' "${stamp}"; then
+            echo "Could not extract the stamp step ❌"
+            echo "Update the extraction in this job to match"
+            exit 1
+          fi
+          root="${RUNNER_TEMP}/wsstamp"
+          rm -rf "${root}"
+          mkdir -p "${root}/home" "${root}/proj/packages/a"
+          errors=0
+          # $1 case, $2 project .npmrc
+          check() {
+            printf '%s\n' '{"name": "ws-root", "version": "1.0.0",' \
+              ' "private": true, "workspaces": ["packages/*"]}' \
+              > "${root}/proj/package.json"
+            printf '%s\n' \
+              '{"name": "ws-child", "version": "1.0.0"}' \
+              > "${root}/proj/packages/a/package.json"
+            printf '%s\n' "$2" > "${root}/proj/.npmrc"
+            set +e
+            env \
+              HOME="${root}/home" \
+              GITHUB_WORKSPACE="${root}" \
+              PROJECT_DIR='proj' \
+              PUBLISH_VERSION='7.7.7' \
+              bash "${stamp}" > /dev/null 2>&1
+            rc=$?
+            set -e
+            target="$(jq -r '.version // empty' \
+              "${root}/proj/package.json")"
+            sibling="$(jq -r '.version // empty' \
+              "${root}/proj/packages/a/package.json")"
+            if [ "${rc}" != "0" ]; then
+              echo "$1: stamp failed ❌"
+              errors=1
+            fi
+            if [ "${target}" != "7.7.7" ]; then
+              echo "$1: target not stamped (${target}) ❌"
+              errors=1
+            fi
+            if [ "${sibling}" != "1.0.0" ]; then
+              echo "$1: sibling was rewritten to ${sibling} ❌"
+              errors=1
+            fi
+          }
+          check 'workspace root, no npm config' ''
+          check 'workspace root, workspaces=true' 'workspaces=true'
+          # A workspace *selector* in an .npmrc conflicts with the
+          # flag rather than being overridden by it, and nothing can
+          # detect it beforehand. It must fail at the stamp -- before
+          # anything publishes -- and say what to do about it.
+          printf '%s\n' '{"name": "ws-root", "version": "1.0.0",' \
+            ' "private": true, "workspaces": ["packages/*"]}' \
+            > "${root}/proj/package.json"
+          printf '%s\n' \
+            '{"name": "ws-child", "version": "1.0.0"}' \
+            > "${root}/proj/packages/a/package.json"
+          printf '%s\n' 'workspace=packages/a' \
+            > "${root}/proj/.npmrc"
+          set +e
+          sel_out="$(env \
+            HOME="${root}/home" \
+            GITHUB_WORKSPACE="${root}" \
+            PROJECT_DIR='proj' \
+            PUBLISH_VERSION='7.7.7' \
+            bash "${stamp}" 2>&1)"
+          sel_rc=$?
+          set -e
+          if [ "${sel_rc}" = "0" ]; then
+            echo "workspace selector: stamp unexpectedly succeeded ❌"
+            errors=1
+          fi
+          if ! printf '%s' "${sel_out}" \
+            | grep -q 'workspace is selected in npm'; then
+            echo "workspace selector: no actionable message ❌"
+            errors=1
+          fi
+          sel_sibling="$(jq -r '.version // empty' \
+            "${root}/proj/packages/a/package.json")"
+          if [ "${sel_sibling}" != "1.0.0" ]; then
+            echo "workspace selector: sibling was rewritten ❌"
+            errors=1
+          fi
+          if [ "${errors}" != "0" ]; then
+            echo "Workspace stamping tests failed ❌" \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Stamping confined to the target package ✅"
+          echo "Stamping confined to the target package ✅" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+  ### Test that publishing never fans out across a workspace ###
+  # test-workspace-stamp extracts the stamp step, so neither the
+  # publish's own --no-workspaces nor the fan-out guard on its result
+  # is exercised there. Run the whole action against a workspace
+  # fixture instead, in dry-run mode, and assert it reports the
+  # target package alone.
+  #
+  # Two workspace children, deliberately. With one, npm reports a
+  # single entry either way and only the *name* differs; with two,
+  # dropping the flag makes npm emit an entry per child. So the case
+  # discriminates against both regressions independently: without the
+  # flag the fan-out guard rejects two entries and the action fails,
+  # and without the guard as well the reported package is a child
+  # rather than the target.
+  test-workspace-publish:
+    name: "Test: publishing ignores sibling workspace packages"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      # Load the egress allow-list out-of-band from the
+      # organisation's .github repository and publish it as
+      # $CONNECTION_ALLOW_LIST for the harden-runner step below.
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@6db537b3e6d060c3287c5a3ce2c28b55b0af330d # v0.2.1
+        with:
+          config: '@807a544b7e55a9224b2b3780e636467bd4b5b99b' # v0.5.0
+
+      # Harden the runner with the just-loaded allow-list.
+      - name: "Harden runner (block)"
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Checkout repository"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: "Create a workspace fixture with two children"
+        shell: bash
+        run: |
+          # Create a workspace fixture with two children
+          mkdir -p ws-project/packages/a ws-project/packages/b
+          # These names reach npm during the dry run, which queries
+          # the registry for an existing version. Names anyone could
+          # register would fail CI without a code change, so use ones
+          # nobody is plausibly going to claim.
+          printf '%s\n' \
+            '{"name": "lfreleng-node-publish-action-ws-fixture",' \
+            ' "version": "1.0.0", "workspaces": ["packages/*"]}' \
+            > ws-project/package.json
+          printf '%s\n' \
+            '{"name": "lfreleng-node-publish-action-ws-child-a",' \
+            ' "version": "1.0.0"}' \
+            > ws-project/packages/a/package.json
+          printf '%s\n' \
+            '{"name": "lfreleng-node-publish-action-ws-child-b",' \
+            ' "version": "1.0.0"}' \
+            > ws-project/packages/b/package.json
+          for manifest in ws-project/package.json \
+            ws-project/packages/a/package.json \
+            ws-project/packages/b/package.json; do
+            jq -e . "${manifest}" > /dev/null
+          done
+
+      - name: "Dry-run publish from the workspace root"
+        id: ws-publish
+        uses: ./
+        with:
+          path_prefix: ws-project
+          publish_version: '9.9.9'
+          dry_run: 'true'
+
+      # A workspace selected through the environment is the one
+      # source npm refuses alongside --no-workspaces, so validation
+      # rejects it rather than letting the stamp fail. Nothing else
+      # covers that branch: the selector case in test-workspace-stamp
+      # writes 'workspace=' to an .npmrc, which reaches npm through a
+      # different route entirely.
+      #
+      # Set in upper case deliberately. npm matches the npm_config_
+      # prefix case insensitively and callers naturally write
+      # environment variables this way, so the check folds case
+      # before comparing; a literal lower-case comparison would miss
+      # the form people actually use.
+      - name: "Workspace selected via environment [expected failure]"
+        id: ws-env
+        continue-on-error: true
+        env:
+          NPM_CONFIG_WORKSPACE: 'packages/a'
+        uses: ./
+        with:
+          path_prefix: ws-project
+          publish_version: '5.5.5'
+          dry_run: 'true'
+
+      - name: "Verify only the target package was published"
+        shell: bash
+        env:
+          NAME: ${{ steps.ws-publish.outputs.package_name }}
+          VERSION: ${{ steps.ws-publish.outputs.published_version }}
+          WS_ENV: ${{ steps.ws-env.outcome }}
+        run: |
+          # Verify only the target package was published
+          errors=0
+          want='lfreleng-node-publish-action-ws-fixture'
+          if [ "${NAME}" != "${want}" ]; then
+            echo "Reported package was '${NAME}', expected" \
+              "'${want}' ❌"
+            errors=1
+          fi
+          if [ "${VERSION}" != "9.9.9" ]; then
+            echo "Reported version was '${VERSION}', expected" \
+              "9.9.9 ❌"
+            errors=1
+          fi
+          # The stamp is workspace confined too, so the children must
+          # still carry their own versions
+          for child in a b; do
+            child_version="$(jq -r '.version // empty' \
+              "ws-project/packages/${child}/package.json")"
+            if [ "${child_version}" != "1.0.0" ]; then
+              echo "Child ${child} was rewritten to" \
+                "${child_version} ❌"
+              errors=1
+            fi
+          done
+          # The environment selector must fail during validation,
+          # before the stamp. Asserting the outcome alone would not
+          # discriminate, so check the version never moved to the one
+          # that case requested: a regression letting the run reach
+          # the stamp would leave 5.5.5 behind.
+          if [ "${WS_ENV}" != "failure" ]; then
+            echo "NPM_CONFIG_WORKSPACE selection was accepted ❌"
+            errors=1
+          fi
+          root_version="$(jq -r '.version // empty' \
+            ws-project/package.json)"
+          if [ "${root_version}" = "5.5.5" ]; then
+            echo "Environment selector was caught after the stamp ❌"
+            errors=1
+          fi
+          if [ "${errors}" != "0" ]; then
+            echo "Workspace publish tests failed ❌" \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Publishing confined to the target package ✅"
+          echo "Publishing confined to the target package ✅" \
+            >> "$GITHUB_STEP_SUMMARY"
