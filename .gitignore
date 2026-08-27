@@ -51,6 +51,12 @@ docs/_build/*
 cover/*
 MANIFEST
 
+# The bundled action entry points are an exception to dist/* above.
+# GitHub runs a composite action straight from the repository with no
+# build step available, so the bundle has to be committed.
+!dist/
+!dist/**
+
 # Per-project virtualenvs
 .venv*/
 .conda*/
@@ -58,3 +64,5 @@ MANIFEST
 
 # Node
 node_modules/*
+coverage/
+.vitest/

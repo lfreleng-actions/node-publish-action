@@ -132,14 +132,43 @@ The `nexus_user`, `scope` and credential inputs pass through to
    scripts the project defines, since `--ignore-scripts` means they
    do not run
 4. **Publish**: `npm publish --json --no-workspaces` with the
-   configured tag, access and provenance flags; the action parses the
-   JSON metadata and verifies the published version matches the
-   request
+   configured tag, access and provenance flags. The action then
+   recovers npm's metadata from the captured output and checks the
+   published version against the request. See
+   [Publish Output Parsing](#publish-output-parsing)
 5. **Verify** (real publishes): `npm view <name>@<version>` against
    the target registry confirms availability; an unreadable package
    downgrades to a warning (registries may restrict anonymous reads
    or index asynchronously), while a readable package with the wrong
    version fails the action
+
+## Publish Output Parsing
+
+npm runs lifecycle scripts with inherited stdio, so whatever
+`prepublishOnly`, `publish` and `postpublish` print lands in the same
+stream as npm's `--json` output. That stream seldom holds a bare JSON
+document, and it can contain unbalanced braces or JSON objects the
+hooks produced themselves.
+
+The action locates npm's object structurally, restarting at every
+opening brace so an unbalanced one cannot swallow the rest, and then
+selects by **shape**: an object counts as publish metadata when it
+carries `name`, `version` and `filename` as strings, in either npm
+generation's layout. npm 10 placed those at the top level; npm 11
+keys the object by package name.
+
+If npm's exit status is non-zero, the action reports a publish
+failure. If npm **succeeded** and the action still cannot read the
+metadata, it says so explicitly and states that the package reached
+the registry, because retrying that publish cannot succeed — it fails
+with `EPUBLISHCONFLICT` on a version that the registry already holds.
+
+> [!NOTE]
+> The action tolerates hooks that print to stdout, but stdout is the
+> channel npm reports through. A hook printing an object carrying
+> `name`, `version` and `filename` as strings looks like npm's own
+> report in every respect but the version, so prefer stderr for hook
+> diagnostics.
 
 ## Dry-Run Mode
 
@@ -255,6 +284,49 @@ touches the path. Paths that escape the workspace fail the action.
   the project defines them; run builds beforehand (for example via
   [node-build-action](https://github.com/lfreleng-actions/node-build-action))
   so the packed content is complete
+
+## Development
+
+The action remains a composite action, so it can call
+`actions/setup-node` to select the Node.js version the publish runs
+under. Logic that needs real testing lives in TypeScript under `src/`
+and runs as a small Node program invoked from `action.yaml`.
+
+```bash
+npm ci          # install the toolchain
+npm run typecheck
+npm test        # vitest
+npm run build   # bundle src/ into dist/ with esbuild
+```
+
+esbuild strips the TypeScript types itself, so bundling stays
+independent of the compiler version; `tsc --noEmit` handles type
+checking. The build output is deterministic, which the `check-dist`
+job depends on.
+
+Two different Node.js floors apply, and they are not the same number:
+
+- **The development toolchain** needs the version in `engines`
+  (`^20.19.0 || >=22.12.0`), which vitest and vite require. It governs
+  `npm ci` and the commands above
+- **The bundle** targets `node18`, because it runs on whatever
+  `node_version` selected for the publish rather than on the toolchain.
+  The publish step runs it with `--selftest` ahead of npm, so a runtime
+  too old to load it fails the run while nothing has yet reached the
+  registry
+
+The repository **commits** `dist/`. GitHub runs an action straight
+from the repository and offers no build step, so the bundle has to be
+present. The `check-dist` CI job rebuilds it and fails when the result
+differs from what the repository holds, so it cannot drift from
+`src/`. Run `npm run build` and commit the result alongside any source
+change.
+
+The bundle carries no third-party runtime dependencies.
+`src/actions-io.ts` implements the slice of the Actions runner
+protocol this action needs — outputs, workflow commands and their
+escaping — with unit tests, which keeps the committed bundle small
+enough to review.
 
 [pre-commit.ci results page]: https://results.pre-commit.ci/latest/github/lfreleng-actions/node-publish-action/main
 [pre-commit.ci status badge]: https://results.pre-commit.ci/badge/github/lfreleng-actions/node-publish-action/main.svg
