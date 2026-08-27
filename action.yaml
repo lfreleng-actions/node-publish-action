@@ -403,7 +403,7 @@ runs:
     - name: "Create authenticated .npmrc"
       if: inputs.dry_run != 'true'
       # yamllint disable-line rule:line-length
-      uses: lfreleng-actions/node-create-npmrc-action@ec0cc1fa52dea5205897d0e3b25dfaf4ebe095fe # v0.1.2
+      uses: lfreleng-actions/node-create-npmrc-action@7d80716b718bf161255c93303418961d41cb1899 # v0.1.3
       with:
         registry_url: ${{ inputs.registry_url }}
         nexus_user: ${{ inputs.nexus_user }}
