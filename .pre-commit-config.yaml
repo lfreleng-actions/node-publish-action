@@ -15,7 +15,11 @@ ci:
 
     Signed-off-by: pre-commit-ci[bot] <pre-commit-ci@users.noreply.github.com>
 
-exclude: "^docs/conf.py"
+# docs/conf.py is vendored. dist/ holds the generated action bundle, which
+# has to match 'npm run build' byte for byte: a formatting hook rewriting it
+# would leave the committed bundle differing from a fresh build, which the
+# check-dist CI job then reports as drift.
+exclude: "^(docs/conf\\.py|dist/)"
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
@@ -100,6 +104,10 @@ repos:
     rev: 57b21406f092110c18776e39b0bda50d37c945c8  # frozen: v2.4.3
     hooks:
       - id: codespell
+        # package-lock.json is generated and holds base64 integrity
+        # hashes, whose fragments read as misspellings; it carries no
+        # prose to check.
+        exclude: "^package-lock\\.json$"
 
   # Requires a mirror, primary repo lacks .pre-commit-hooks.yaml
   - repo: https://github.com/DetachHead/basedpyright-prek-mirror

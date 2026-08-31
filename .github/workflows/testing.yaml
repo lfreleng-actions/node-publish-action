@@ -400,169 +400,6 @@ jobs:
           echo "Version lifecycle scripts correctly suppressed ✅" \
             >> "$GITHUB_STEP_SUMMARY"
 
-  ### Test the publish metadata shape normalisation ###
-  # npm 10 put name/version/filename at the top level; npm 11 keys
-  # the object by package name. The action normalises both, and the
-  # discriminator has to be the *type* of .name rather than its
-  # presence, because a package legitimately called 'name' produces
-  # {"name": {...}} under npm 11.
-  #
-  # No fixture can cover that: a dry run for a package named 'name'
-  # would query the real registry, where that name is taken. So the
-  # expression is extracted from action.yaml and run over the shapes
-  # directly -- extracted rather than restated, so a regression in
-  # the shipped filter fails the test.
-  test-publish-metadata:
-    name: "Test: publish metadata normalisation"
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    timeout-minutes: 10
-    steps:
-      # Load the egress allow-list out-of-band from the
-      # organisation's .github repository and publish it as
-      # $CONNECTION_ALLOW_LIST for the harden-runner step below.
-      # yamllint disable-line rule:line-length
-      - uses: lfreleng-actions/harden-runner-block-action@6db537b3e6d060c3287c5a3ce2c28b55b0af330d # v0.2.1
-        with:
-          config: '@807a544b7e55a9224b2b3780e636467bd4b5b99b' # v0.5.0
-
-      # Harden the runner with the just-loaded allow-list.
-      - name: "Harden runner (block)"
-        # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@b09bb98e06d4d774595224525879c09bc6e98c40 # v2.20.1
-        with:
-          egress-policy: 'block'
-          allowed-endpoints: >
-            ${{ env.CONNECTION_ALLOW_LIST }}
-
-      - name: "Checkout repository"
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: "Exercise the metadata filter over both npm shapes"
-        shell: bash
-        run: |
-          # Exercise the metadata filter over both npm shapes
-          # shellcheck disable=SC2016  # a jq filter, not a shell var
-          raw="$(grep -A1 -m1 '^        meta="\$(jq -c' action.yaml)"
-          filter="${raw#*jq -c \'}"
-          filter="${filter%\' \\}"
-          # Fail loudly rather than silently testing nothing if the
-          # expression is renamed or reindented
-          if ! printf '%s' "${filter}" | grep -q 'to_entries'; then
-            echo "Could not extract the metadata filter ❌"
-            echo "Update the extraction in this job to match"
-            exit 1
-          fi
-          errors=0
-          check() {
-            got="$(printf '%s' "$2" | jq -c "${filter}" 2>/dev/null \
-              | jq -r '[(.name|tostring), (.version|tostring),
-                        (.filename|tostring)] | join(" ")' \
-              2>/dev/null)"
-            if [ "${got}" != "$3" ]; then
-              echo "$1: got '${got}', want '$3' ❌"
-              errors=1
-            fi
-          }
-          check 'npm10 flat' \
-            '{"name":"pkg","version":"1.0.0","filename":"pkg.tgz"}' \
-            'pkg 1.0.0 pkg.tgz'
-          check 'npm11 keyed' \
-            '{"pkg":{"name":"pkg","version":"1.0.0","filename":"pkg.tgz"}}' \
-            'pkg 1.0.0 pkg.tgz'
-          scoped_in='{"@onap/ui":{"name":"@onap/ui",'
-          scoped_in="${scoped_in}"'"version":"2.0.0",'
-          scoped_in="${scoped_in}"'"filename":"onap-ui-2.0.0.tgz"}}'
-          check 'npm11 scoped key' "${scoped_in}" \
-            '@onap/ui 2.0.0 onap-ui-2.0.0.tgz'
-          named_in='{"name":{"name":"name","version":"3.0.0",'
-          named_in="${named_in}"'"filename":"name-3.0.0.tgz"}}'
-          check 'npm11 package literally named name' "${named_in}" \
-            'name 3.0.0 name-3.0.0.tgz'
-          check 'npm10 package literally named name' \
-            '{"name":"name","version":"3.0.0","filename":"name-3.0.0.tgz"}' \
-            'name 3.0.0 name-3.0.0.tgz'
-          check 'empty object fails closed' '{}' 'null null null'
-          if [ "${errors}" != "0" ]; then
-            echo "Metadata normalisation tests failed ❌" \
-              >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
-          echo "Publish metadata normalisation correct ✅"
-          echo "Publish metadata normalisation correct ✅" \
-            >> "$GITHUB_STEP_SUMMARY"
-
-      # The fan-out guard sits beside the filter above and rejects a
-      # multi-entry result. test-workspace-publish cannot reach it:
-      # --no-workspaces stops npm producing more than one entry, so
-      # deleting the guard on its own leaves that job green. It is a
-      # backstop for the case where the flag is bypassed, which by
-      # definition no end-to-end fixture can create -- so drive it
-      # directly, over the shapes npm emits when it does fan out.
-      - name: "Exercise the workspace fan-out guard"
-        shell: bash
-        run: |
-          # Exercise the workspace fan-out guard
-          guard="${RUNNER_TEMP}/fanout.sh"
-          # shellcheck disable=SC2016  # a sed address, not a shell var
-          sed -n '/^        entry_count="\$(jq -r/,/^        esac$/p' \
-            action.yaml | sed 's/^        //' > "${guard}"
-          # Fail loudly rather than silently testing nothing if the
-          # block is renamed or reindented
-          if ! grep -q 'entry_count' "${guard}"; then
-            echo "Could not extract the fan-out guard ❌"
-            echo "Update the extraction in this job to match"
-            exit 1
-          fi
-          scratch_dir="${RUNNER_TEMP}/fanout"
-          rm -rf "${scratch_dir}"
-          mkdir -p "${scratch_dir}"
-          export scratch_dir
-          errors=0
-          # $1 case, $2 want (reject|allow), $3 publish.json body
-          check() {
-            printf '%s' "$3" > "${scratch_dir}/publish.json"
-            set +e
-            bash "${guard}" > /dev/null 2>&1
-            rc=$?
-            set -e
-            if [ "${rc}" != "0" ]; then
-              got='reject'
-            else
-              got='allow'
-            fi
-            if [ "${got}" != "$2" ]; then
-              echo "$1: guard returned ${got}, expected $2 ❌"
-              errors=1
-            fi
-          }
-          check 'npm10 flat single' allow \
-            '{"name":"pkg","version":"1.0.0"}'
-          check 'npm11 keyed single' allow '{"pkg":{"name":"pkg"}}'
-          # A package literally named 'name' is a single publish, not
-          # a fan-out; the type test has to hold here too
-          check 'npm11 package named name' allow \
-            '{"name":{"name":"name","version":"3.0.0"}}'
-          check 'two packages' reject \
-            '{"a":{"name":"a"},"b":{"name":"b"}}'
-          check 'three packages' reject \
-            '{"a":{},"b":{},"c":{}}'
-          # An empty object is not fan-out. It falls through to the
-          # metadata checks, which report the missing fields more
-          # usefully than a count would.
-          check 'empty object' allow '{}'
-          if [ "${errors}" != "0" ]; then
-            echo "Fan-out guard tests failed ❌" \
-              >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
-          echo "Fan-out guard rejects multi-package results ✅"
-          echo "Fan-out guard rejects multi-package results ✅" \
-            >> "$GITHUB_STEP_SUMMARY"
-
   ### Test that stamping never touches sibling workspace packages ###
   # 'npm version' is workspace aware and runs before the publish, so
   # with workspaces enabled in configuration it stamps every
@@ -1150,4 +987,238 @@ jobs:
           fi
           echo "Invalid authentication modes correctly rejected ✅"
           echo "Invalid authentication modes correctly rejected ✅" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+  ### Unit tests for the TypeScript sources ###
+  # The publish-output parser has no jq equivalent: it locates npm's JSON
+  # inside a stream that lifecycle scripts also write to, then normalises
+  # two npm generations' shapes. Testing it as a function removes the need
+  # to extract a fragment of action.yaml and run it against fixtures.
+  test-unit:
+    name: "Test: TypeScript unit tests"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      # Load the egress allow-list out-of-band from the
+      # organisation's .github repository and publish it as
+      # $CONNECTION_ALLOW_LIST for the harden-runner step below.
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@2a70c3284392b8d6ee85a509dd4e9818801a7e82 # v0.11.1
+        with:
+          config: '@807a544b7e55a9224b2b3780e636467bd4b5b99b' # v0.5.0
+
+      # Harden the runner with the just-loaded allow-list.
+      - name: "Harden runner (block)"
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Checkout repository"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: "Setup Node.js"
+        # yamllint disable-line rule:line-length
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: "Install dependencies"
+        shell: bash
+        run: |
+          # Install dependencies
+          npm ci --no-audit --no-fund
+
+      - name: "Type check"
+        shell: bash
+        run: |
+          # Type check
+          npm run typecheck
+
+      - name: "Run unit tests"
+        shell: bash
+        run: |
+          # Run unit tests
+          npm test
+
+  ### Verify the committed bundle matches the sources ###
+  # GitHub runs this action straight from the repository, so dist/ has to
+  # be committed. That makes it possible for the bundle to drift from src/,
+  # and a reviewer reading the diff would see the sources change while the
+  # code that actually runs did not. Rebuild and compare.
+  check-dist:
+    name: "Test: committed bundle matches sources"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      # Load the egress allow-list out-of-band from the
+      # organisation's .github repository and publish it as
+      # $CONNECTION_ALLOW_LIST for the harden-runner step below.
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@2a70c3284392b8d6ee85a509dd4e9818801a7e82 # v0.11.1
+        with:
+          config: '@807a544b7e55a9224b2b3780e636467bd4b5b99b' # v0.5.0
+
+      # Harden the runner with the just-loaded allow-list.
+      - name: "Harden runner (block)"
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Checkout repository"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: "Setup Node.js"
+        # yamllint disable-line rule:line-length
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: "Rebuild and compare against the committed bundle"
+        shell: bash
+        run: |
+          # Rebuild and compare against the committed bundle
+          npm ci --no-audit --no-fund
+          npm run build
+          # git diff sees modified tracked files only, so a build that
+          # emits a *new* artefact nobody committed would slip through.
+          # --porcelain with --untracked-files=all reports additions,
+          # modifications and deletions alike.
+          drift="$(git status --porcelain --untracked-files=all -- dist/)"
+          if [ -n "${drift}" ]; then
+            echo "The committed bundle differs from a fresh build ❌"
+            printf '%s\n' "${drift}"
+            echo "Run 'npm run build' and commit the result."
+            echo "Committed bundle is stale ❌" \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Committed bundle matches the sources ✅"
+          echo "Committed bundle matches the sources ✅" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+  ### Test that lifecycle output cannot corrupt the parsed metadata ###
+  # npm runs lifecycle scripts with inherited stdio, so their output lands
+  # in the same stream the action captures for npm's JSON. Nothing else in
+  # this workflow trips it: test-lifecycle-hooks uses 'touch', and the
+  # fixtures elsewhere are silent by accident rather than by design.
+  #
+  # The hooks here reproduce what broke the jq parse: an unbalanced brace,
+  # a hook's own JSON object, and a stray closing brace, both before and
+  # after npm's report.
+  test-lifecycle-output:
+    name: "Test: lifecycle output does not corrupt metadata"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      # Load the egress allow-list out-of-band from the
+      # organisation's .github repository and publish it as
+      # $CONNECTION_ALLOW_LIST for the harden-runner step below.
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@2a70c3284392b8d6ee85a509dd4e9818801a7e82 # v0.11.1
+        with:
+          config: '@807a544b7e55a9224b2b3780e636467bd4b5b99b' # v0.5.0
+
+      # Harden the runner with the just-loaded allow-list.
+      - name: "Harden runner (block)"
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@05e31511f85b41b11d1cf0ef85d0992719546e2c # v2.21.0
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Checkout repository"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: "Create a fixture whose hooks write to stdout"
+        shell: bash
+        run: |
+          # Create a fixture whose hooks write to stdout
+          mkdir -p noisy-project
+          # A separate script keeps the noise out of package.json, where
+          # the escaping would be unreadable. It reproduces what broke the
+          # jq parse: an unbalanced brace, a JSON object of the hook's
+          # own, and a stray closing brace.
+          cat > noisy-project/noise.js << 'NOISE'
+          const phase = process.argv[2];
+          if (phase === 'pre') {
+            console.log('building... {unbalanced');
+            console.log(JSON.stringify({ tool: 'webpack', ok: true }));
+          } else {
+            console.log('cleanup done }');
+            console.log(JSON.stringify({ stats: { seconds: 12 } }));
+          }
+          NOISE
+          cat > noisy-project/package.json << 'FIXTURE'
+          {
+            "name": "lfreleng-node-publish-action-noisy-fixture",
+            "version": "1.0.0",
+            "scripts": {
+              "prepublishOnly": "node noise.js pre",
+              "postpublish": "node noise.js post"
+            }
+          }
+          FIXTURE
+          jq -e . noisy-project/package.json > /dev/null
+
+      - name: "Publish with noisy hooks"
+        id: noisy
+        uses: ./
+        with:
+          path_prefix: noisy-project
+          publish_version: '4.4.4'
+          dry_run: 'true'
+
+      - name: "Verify the metadata survived the hook output"
+        shell: bash
+        env:
+          NAME: ${{ steps.noisy.outputs.package_name }}
+          VERSION: ${{ steps.noisy.outputs.published_version }}
+          TARBALL: ${{ steps.noisy.outputs.tarball_name }}
+        run: |
+          # Verify the metadata survived the hook output
+          errors=0
+          want='lfreleng-node-publish-action-noisy-fixture'
+          if [ "${NAME}" != "${want}" ]; then
+            echo "Reported package was '${NAME}', expected '${want}' ❌"
+            errors=1
+          fi
+          if [ "${VERSION}" != "4.4.4" ]; then
+            echo "Reported version was '${VERSION}', expected 4.4.4 ❌"
+            errors=1
+          fi
+          # The hook's own JSON carries no filename, so an empty tarball
+          # would mean the parser picked the wrong object rather than
+          # merely failing to find one.
+          if [ "${TARBALL}" != "${want}-4.4.4.tgz" ]; then
+            echo "Reported tarball was '${TARBALL}' ❌"
+            errors=1
+          fi
+          if [ "${errors}" != "0" ]; then
+            echo "Lifecycle output corrupted the metadata ❌" \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Metadata parsed correctly despite hook output ✅"
+          echo "Metadata parsed correctly despite hook output ✅" \
             >> "$GITHUB_STEP_SUMMARY"

@@ -664,118 +664,48 @@ runs:
         fi
 
         cd "${PROJECT_DIR}" || exit 1
+
+        # The parser below runs on the Node.js that node_version or
+        # node_version_file selected, which can sit below what the
+        # bundle targets. Starting it there would fail *after* npm had
+        # published -- the exact unsafe failure the parser exists to
+        # prevent -- so prove it runs first. Before the publish this
+        # costs nothing.
+        if ! node \
+          "${GITHUB_ACTION_PATH}/dist/parse-publish-output/index.js" \
+          --selftest; then
+          echo "::error::The selected Node.js cannot run this action's" \
+            "publish-output parser, which reads npm's result. Refusing" \
+            "to publish, because the failure would otherwise land after" \
+            "the package reached the registry. Raise node_version, or" \
+            "the version in the file named by node_version_file, to a" \
+            "release this action supports."
+          exit 1
+        fi
+
         set +e
         npm "$@" > "${scratch_dir}/publish.json"
         publish_exit=$?
         set -e
-        if [ "${publish_exit}" != "0" ]; then
-          echo "::error::npm publish failed (exit ${publish_exit}) ❌"
-          exit 1
-        fi
 
-        # The --json output carries the publish metadata; verify it
-        # matches the requested version before emitting outputs.
+        # Interpreting npm's output is delegated to a small Node
+        # program, because the captured stream is not reliably a JSON
+        # document. npm runs lifecycle scripts with inherited stdio,
+        # so prepublishOnly, publish and postpublish output lands in
+        # the same file -- including unbalanced braces and JSON of
+        # the hooks' own. Locating npm's object within that, in
+        # either npm generation's shape, is beyond what a jq filter
+        # can do safely, and it is unit tested rather than exercised
+        # by extracting a fragment of this file.
         #
-        # Enforce the singular contract on the result rather than
-        # trusting the flag alone: an explicit workspace selection
-        # skips it, and npm could fan out. Reporting one package
-        # while several reached the registry is the failure worth
-        # preventing.
-        entry_count="$(jq -r 'if (.name | type) == "string"
-          then 1 else (to_entries | length) end' \
-          "${scratch_dir}/publish.json" 2>/dev/null || echo 1)"
-        # Only fan-out is an error here. An empty object falls
-        # through to the metadata checks below, which report the
-        # missing fields more usefully than a count would.
-        case "${entry_count}" in
-          ''|0|1) ;;
-          *)
-            echo "::error::npm published ${entry_count} packages," \
-              "but this action verifies and reports one. Publish" \
-              "each workspace package with its own path_prefix" \
-              "rather than selecting several at once."
-            exit 1 ;;
-        esac
-        #
-        # npm 11 keys that object by package name, where npm 10 put
-        # the fields at the top level. Reading the top level on npm
-        # 11 returns empty for every field, so the action aborts --
-        # after the package has already reached the registry.
-        # Normalise to the inner object so both shapes parse, rather
-        # than pinning this action to an npm generation.
-        #
-        # Select on the type of .name rather than its presence. A
-        # package legitimately named "name" produces {"name": {...}}
-        # under npm 11, which a presence test reads as the npm 10
-        # flat shape and hands back the metadata object as the
-        # package name -- failing the publish after it succeeded.
-        # Under npm 10 .name is a string; under npm 11 it is either
-        # absent or the nested object.
-        meta="$(jq -c 'if (.name | type) == "string" then .
-          else (to_entries | .[0].value // {}) end' \
-          "${scratch_dir}/publish.json")"
-        package_name="$(printf '%s' "${meta}" | jq -r '.name // empty')"
-        published_version="$(printf '%s' "${meta}" \
-          | jq -r '.version // empty')"
-        tarball_name="$(printf '%s' "${meta}" \
-          | jq -r '.filename // empty')"
-        # Constrain the reported name to the npm package name
-        # character set before further use in commands and logs
-        case "${package_name}" in
-          *[!@A-Za-z0-9._/-]*|'')
-            echo "Error: npm reported an unusable package name ❌"
-            exit 1 ;;
-        esac
-        if [ "${published_version}" != "${PUBLISH_VERSION}" ]; then
-          echo "Error: published version mismatch ❌"
-          printf 'npm reported: %s\n' \
-            "$(printf '%s' "${published_version}" | tr -d '\r\n')"
-          echo "Expected: ${PUBLISH_VERSION}"
-          exit 1
-        fi
-        if [ -z "${tarball_name}" ]; then
-          echo "Error: npm reported no tarball filename ❌"
-          exit 1
-        fi
-
-        # The metadata values originate from npm's JSON output and
-        # could legally contain unusual characters, so they use the
-        # multiline heredoc output format with a random delimiter
-        # (built from shell-builtin randomness, regenerated until
-        # provably absent from the value) to prevent output-file
-        # injection
-        emit_output() {
-          key="$1"
-          value="$2"
-          delimiter="ghadelim_${RANDOM}${RANDOM}${RANDOM}${RANDOM}"
-          while [ "${value#*"${delimiter}"}" != "${value}" ]; do
-            delimiter="ghadelim_${RANDOM}${RANDOM}${RANDOM}${RANDOM}"
-          done
-          {
-            printf '%s<<%s\n' "${key}" "${delimiter}"
-            printf '%s\n' "${value}"
-            printf '%s\n' "${delimiter}"
-          } >> "$GITHUB_OUTPUT"
-        }
-        emit_output "published_version" "${published_version}"
-        emit_output "package_name" "${package_name}"
-        emit_output "tarball_name" "${tarball_name}"
-
-        echo "Published ${package_name}@${published_version} ✅"
-        {
-          echo "## 🚀 Node.js Package Publish"
-          echo ""
-          if [ "${DRY_RUN}" = "true" ]; then
-            echo "**Mode:** dry run (packs and reports only)"
-          else
-            echo "**Mode:** publish"
-            echo "**Registry:** ${REGISTRY_URL}"
-          fi
-          echo "**Package:** ${package_name}"
-          echo "**Version:** ${published_version}"
-          echo "**Tag:** ${TAG}"
-          echo "**Tarball:** ${tarball_name}"
-        } >> "$GITHUB_STEP_SUMMARY"
+        # It also emits the outputs and the step summary, and
+        # decides the failure message: npm's exit status is passed
+        # in so that a package which reached the registry is never
+        # reported as a bare failure, which would invite a retry
+        # that cannot succeed.
+        PUBLISH_OUTPUT_FILE="${scratch_dir}/publish.json" \
+        PUBLISH_EXIT_CODE="${publish_exit}" \
+          node "${GITHUB_ACTION_PATH}/dist/parse-publish-output/index.js"
 
     # Best-effort registry confirmation for real publishes: some
     # registries restrict anonymous reads or index asynchronously, so
