@@ -5,7 +5,7 @@
 # node-publish-action
 name: "🚀 Node.js Package Publish"
 # yamllint disable-line rule:line-length
-description: "Stamps a version into package.json and publishes the package to an npm registry"
+description: "Publishes a package to an npm registry, stamping the version into package.json or taking an already-packed tarball"
 # Composes node-create-npmrc-action for registry authentication, then
 # runs 'npm version' and 'npm publish' with verification. The npmrc
 # action registers a guaranteed post-job step that scrubs the
@@ -34,6 +34,11 @@ inputs:
     description: "Project directory; must resolve within the workspace"
     required: false
     default: "."
+  tarball_path:
+    # yamllint disable-line rule:line-length
+    description: "Publish this already-packed .tgz instead of packing the project directory; must resolve within the workspace and carry publish_version. Skips the version stamp"
+    required: false
+    default: ""
   node_version:
     # yamllint disable-line rule:line-length
     description: "Node.js version to set up, such as '22', '22.x' or 'lts/*'; characters A-Z a-z 0-9 . * / _ -"
@@ -99,7 +104,8 @@ inputs:
 
 outputs:
   published_version:
-    description: "Version stamped into package.json and published"
+    # yamllint disable-line rule:line-length
+    description: "Published version; stamped into package.json unless tarball_path supplied it"
     value: ${{ steps.publish.outputs.published_version }}
   package_name:
     description: "Package name from the publish metadata"
@@ -119,6 +125,7 @@ runs:
         INPUT_REGISTRY_URL: ${{ inputs.registry_url }}
         INPUT_DRY_RUN: ${{ inputs.dry_run }}
         INPUT_PATH_PREFIX: ${{ inputs.path_prefix }}
+        INPUT_TARBALL_PATH: ${{ inputs.tarball_path }}
         INPUT_NODE_VERSION: ${{ inputs.node_version }}
         INPUT_NODE_VERSION_FILE: ${{ inputs.node_version_file }}
         INPUT_TAG: ${{ inputs.tag }}
@@ -134,11 +141,11 @@ runs:
         # Validate inputs
         # Preflight: fail with a clear message when required tools are
         # missing (possible on minimal self-hosted runners)
-        for tool in jq realpath mktemp tr; do
+        for tool in jq realpath mktemp tr tar; do
           if ! command -v "${tool}" > /dev/null 2>&1; then
             echo "Error: required tool not found: ${tool} ❌"
             echo "This action requires jq, realpath (GNU coreutils,"
-            echo "including -m), mktemp and tr on the runner"
+            echo "including -m), mktemp, tr and tar on the runner"
             exit 1
           fi
         done
@@ -447,10 +454,132 @@ runs:
           echo "Error: no package.json in project directory ❌"
           exit 1
         fi
+        # tarball_path publishes bytes that already exist rather than
+        # packing the project again. It is validated here, against the
+        # same workspace boundary as path_prefix: the value becomes an
+        # 'npm publish' argument, so an escaping path would publish
+        # arbitrary runner content.
+        tarball=''
+        if [ -n "${INPUT_TARBALL_PATH}" ]; then
+          # Check the raw input for line breaks before resolving it.
+          # Command substitution strips trailing newlines, so a value
+          # ending in one would resolve to the newline-free sibling
+          # path and validate a different file from the one named --
+          # silently, and past the resolved-path check below.
+          case "${INPUT_TARBALL_PATH}" in
+            *$'\n'*|*$'\r'*)
+              echo "Error: tarball_path contains a line break ❌"
+              exit 1 ;;
+          esac
+          case "${INPUT_TARBALL_PATH}" in
+            /*) tarball="${INPUT_TARBALL_PATH}" ;;
+            *) tarball="${GITHUB_WORKSPACE}/${INPUT_TARBALL_PATH}" ;;
+          esac
+          # Resolve before testing the type, so a symlink is judged by
+          # its target. Fail closed on realpath failure, as above.
+          #
+          # The sentinel keeps a newline that belongs to the filename.
+          # Command substitution strips every trailing newline, so a
+          # symlink whose target ends in one would otherwise resolve
+          # to the newline-free sibling -- validating one file while
+          # the caller named another, past the guard below. Appending
+          # 'x' and removing it, then exactly one delimiter newline,
+          # leaves any filename newline in place to be caught.
+          if ! resolved_tarball="$(realpath -- "${tarball}" \
+            && printf 'x')"; then
+            echo "Error: cannot resolve tarball_path ❌"
+            printf 'Path not found: %s\n' \
+              "$(printf '%s' "${INPUT_TARBALL_PATH}" | tr -d '\r\n')"
+            exit 1
+          fi
+          resolved_tarball="${resolved_tarball%x}"
+          tarball="${resolved_tarball%$'\n'}"
+          if [ -z "${tarball}" ]; then
+            echo "Error: cannot resolve tarball_path ❌"
+            exit 1
+          fi
+          case "${tarball}" in
+            "${workspace}/"*) ;;
+            *)
+              echo "Error: tarball escapes the workspace ❌"
+              echo "tarball_path must resolve within GITHUB_WORKSPACE"
+              exit 1 ;;
+          esac
+          # The resolved path is written to $GITHUB_OUTPUT as a plain
+          # key=value, so a line break in it would forge a second
+          # output. The raw input is already clear of them, but a
+          # symlink can resolve to a target that is not.
+          case "${tarball}" in
+            *$'\n'*|*$'\r'*)
+              echo "Error: resolved tarball path contains a line" \
+                "break ❌"
+              exit 1 ;;
+          esac
+          # -f follows symlinks and excludes directories, devices and
+          # the dangling-link case in one test.
+          if [ ! -f "${tarball}" ]; then
+            echo "Error: tarball_path is not a file ❌"
+            printf 'Path: %s\n' \
+              "$(printf '%s' "${tarball}" | tr -d '\r\n')"
+            exit 1
+          fi
+          case "${tarball}" in
+            *.tgz) ;;
+            *)
+              echo "Error: tarball_path must name a .tgz file ❌"
+              echo "npm pack produces .tgz; npm publish rejects other"
+              echo "extensions after the credential setup has run"
+              exit 1 ;;
+          esac
+          # The tarball carries its own version, and the stamp step is
+          # skipped, so publish_version no longer decides what ships.
+          # Compare the two rather than letting the input become
+          # decorative: a stale artefact would otherwise publish under
+          # a version the caller never asked for, and the verify step
+          # would then look up the wrong one.
+          # Read the manifest and parse it as two steps. As a single
+          # 'tar | jq' pipeline the exit status is jq's, and jq
+          # succeeds on the empty input a failed tar leaves behind --
+          # so a corrupt archive would fall through to the "declares
+          # no version" branch below and report the wrong cause.
+          # Splitting them also means this does not depend on the
+          # caller's pipefail setting to be correct.
+          if ! tarball_manifest="$(tar -xzOf "${tarball}" \
+            package/package.json 2>/dev/null)"; then
+            echo "Error: cannot read package.json from the tarball ❌"
+            echo "Expected an npm pack archive containing package/"
+            exit 1
+          fi
+          if ! tarball_version="$(printf '%s' "${tarball_manifest}" \
+            | jq -r '.version // empty' 2>/dev/null)"; then
+            echo "Error: package.json in the tarball is not valid" \
+              "JSON ❌"
+            exit 1
+          fi
+          if [ -z "${tarball_version}" ]; then
+            echo "Error: tarball package.json declares no version ❌"
+            exit 1
+          fi
+          if [ "${tarball_version}" != "${INPUT_PUBLISH_VERSION}" ]; then
+            echo "Error: tarball version does not match" \
+              "publish_version ❌"
+            printf 'tarball:        %s\n' \
+              "$(printf '%s' "${tarball_version}" | tr -d '\r\n')"
+            printf 'publish_version: %s\n' \
+              "$(printf '%s' "${INPUT_PUBLISH_VERSION}" | tr -d '\r\n')"
+            echo "Pack the tarball at the version being published"
+            exit 1
+          fi
+          echo "Publishing pre-packed tarball at ${tarball_version} ✅"
+        fi
         # Both values passed the character allowlists above, so the
         # plain output format is safe here
         echo "node_version=${node_version}" >> "$GITHUB_OUTPUT"
         echo "node_version_file=${node_version_file}" >> "$GITHUB_OUTPUT"
+        # Empty when packing the project directory. Re-emitted resolved
+        # rather than as given, so the publish step consumes the path
+        # this step actually checked.
+        echo "tarball=${tarball}" >> "$GITHUB_OUTPUT"
 
     - name: "Setup Node.js"
       # yamllint disable-line rule:line-length
@@ -480,6 +609,12 @@ runs:
 
     - name: "Stamp version into package.json"
       id: stamp
+      # A pre-packed tarball already carries its version, verified
+      # against publish_version in the validate step, and its bytes are
+      # what publishes. Stamping the working tree would change a
+      # manifest nothing reads, and rewriting the tarball is the whole
+      # divergence this input exists to remove.
+      if: inputs.tarball_path == ''
       shell: bash
       env:
         PROJECT_DIR: ${{ inputs.path_prefix }}
@@ -602,6 +737,7 @@ runs:
         TAG: ${{ inputs.tag }}
         ACCESS: ${{ inputs.access }}
         PROVENANCE: ${{ inputs.provenance }}
+        TARBALL: ${{ steps.validate.outputs.tarball }}
         REGISTRY_URL: ${{ inputs.registry_url }}
       run: |
         # Publish package
@@ -639,6 +775,74 @@ runs:
         # Build the publish arguments from validated inputs; every
         # value passed a whole-string allowlist in the validate step
         set -- publish --json --tag "${TAG}"
+        # A pre-packed tarball publishes as a positional argument, and
+        # npm accepts it only immediately after the subcommand, so it
+        # is spliced in before the flags rather than appended. npm then
+        # skips packing entirely, which is the point: the bytes that
+        # were attested are the bytes the registry receives.
+        #
+        # The path is absolute and workspace-checked, so the cd below
+        # still applies for credential resolution without affecting
+        # which file publishes.
+        if [ -n "${TARBALL}" ]; then
+          # Re-resolve and re-check at the point of use, for the same
+          # reason PROJECT_DIR does above: the workspace is mutable
+          # between steps, so a file validated earlier can have been
+          # replaced by an escaping symlink or a different archive.
+          # Fail closed on realpath failure. The sentinel preserves a
+          # newline belonging to the filename, as in the validate step.
+          if ! resolved="$(realpath -- "${TARBALL}" && printf 'x')"; then
+            echo "Error: cannot resolve the tarball ❌"
+            exit 1
+          fi
+          resolved="${resolved%x}"
+          TARBALL="${resolved%$'\n'}"
+          if [ -z "${TARBALL}" ]; then
+            echo "Error: cannot resolve the tarball ❌"
+            exit 1
+          fi
+          case "${TARBALL}" in
+            *$'\n'*|*$'\r'*)
+              echo "Error: resolved tarball path contains a line" \
+                "break ❌"
+              exit 1 ;;
+          esac
+          case "${TARBALL}/" in
+            "${boundary}/"*) ;;
+            *)
+              echo "Error: tarball escapes the workspace ❌"
+              exit 1 ;;
+          esac
+          if [ ! -f "${TARBALL}" ]; then
+            echo "Error: tarball is no longer a file ❌"
+            exit 1
+          fi
+          # Re-read the version too. The boundary checks above stop a
+          # swap for content outside the workspace; they say nothing
+          # about a different archive appearing inside it, which is
+          # exactly the substitution that would publish bytes nobody
+          # attested.
+          if ! manifest="$(tar -xzOf "${TARBALL}" \
+            package/package.json 2>/dev/null)"; then
+            echo "Error: cannot read package.json from the tarball ❌"
+            exit 1
+          fi
+          if ! version="$(printf '%s' "${manifest}" \
+            | jq -r '.version // empty' 2>/dev/null)"; then
+            echo "Error: package.json in the tarball is not valid" \
+              "JSON ❌"
+            exit 1
+          fi
+          if [ "${version}" != "${PUBLISH_VERSION}" ]; then
+            echo "Error: the tarball changed since validation ❌"
+            printf 'tarball:         %s\n' \
+              "$(printf '%s' "${version}" | tr -d '\r\n')"
+            printf 'publish_version: %s\n' \
+              "$(printf '%s' "${PUBLISH_VERSION}" | tr -d '\r\n')"
+            exit 1
+          fi
+          set -- publish "${TARBALL}" --json --tag "${TAG}"
+        fi
         # This action publishes the single package at path_prefix.
         # With workspaces enabled through configuration, npm would
         # fan out and emit one metadata entry per package, while the

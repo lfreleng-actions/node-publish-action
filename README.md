@@ -51,7 +51,7 @@ steps:
 ## Requirements
 
 The action needs `jq`, `realpath` (GNU coreutils, including `-m`
-support), `mktemp` and `tr` on the runner. GitHub-hosted Ubuntu
+support), `mktemp`, `tr` and `tar` on the runner. GitHub-hosted Ubuntu
 runners include these tools; minimal self-hosted or non-Linux runners
 must provide them. The action checks for them up front and fails with
 a clear error naming any missing tool. It installs Node.js and npm via
@@ -69,6 +69,7 @@ publishes nothing and writes no credential.
 | registry_url             | False    | `''`     | Target npm registry URL ending with `/`; required unless `dry_run` is `'true'`               |
 | dry_run                  | False    | `false`  | Pack and verify without publishing (npm may still read the registry); skips credential setup |
 | path_prefix              | False    | `.`      | Project directory; must resolve within the workspace                                         |
+| tarball_path             | False    | `''`     | Publish this already-packed `.tgz` instead of packing `path_prefix`; skips the version stamp |
 | node_version             | False    | `22`     | Node.js version to set up, such as `22`, `22.x` or `lts/*`                                   |
 | node_version_file        | False    | `''`     | File containing the Node.js version, such as `.nvmrc`; overrides `node_version`              |
 | tag                      | False    | `latest` | npm distribution tag                                                                         |
@@ -108,11 +109,11 @@ The `nexus_user`, `scope` and credential inputs pass through to
 
 <!-- markdownlint-disable MD013 -->
 
-| Name              | Description                                        |
-| ----------------- | -------------------------------------------------- |
-| published_version | Version stamped into `package.json` and published  |
-| package_name      | Package name from the publish metadata             |
-| tarball_name      | Tarball filename from the publish metadata         |
+| Name              | Description                                                                      |
+| ----------------- | -------------------------------------------------------------------------------- |
+| published_version | Published version; stamped into `package.json` unless `tarball_path` supplied it |
+| package_name      | Package name from the publish metadata                                           |
+| tarball_name      | Tarball filename from the publish metadata                                       |
 
 <!-- markdownlint-enable MD013 -->
 
@@ -130,9 +131,12 @@ The `nexus_user`, `scope` and credential inputs pass through to
    `package.json`, with the result read back and verified. A
    `::notice::` names any `preversion`/`version`/`postversion`
    scripts the project defines, since `--ignore-scripts` means they
-   do not run
+   do not run. **Skipped entirely with `tarball_path`**, where the
+   archive already carries the version
 4. **Publish**: `npm publish --json --no-workspaces` with the
-   configured tag, access and provenance flags. The action then
+   configured tag, access and provenance flags, packing the project
+   directory — or `npm publish <tarball>` when `tarball_path` names
+   an archive, which packs nothing. The action then
    recovers npm's metadata from the captured output and checks the
    published version against the request. See
    [Publish Output Parsing](#publish-output-parsing)
@@ -257,6 +261,48 @@ with provenance support (npmjs.org) and requires an OIDC token
 leave the input at `false` for Nexus targets; generate GitHub
 artifact attestations for the packed tarball instead.
 
+## Publishing a Pre-Packed Tarball
+
+By default the action packs `path_prefix` at publish time. Set
+`tarball_path` to publish an archive that already exists instead:
+
+```yaml
+- uses: lfreleng-actions/node-publish-action@<sha>
+  with:
+    publish_version: '1.2.3'
+    tarball_path: 'pack-dist/my-package-1.2.3.tgz'
+    registry_url: 'https://registry.example.org/'
+```
+
+This matters when something else has to reason about the exact bytes
+that reach the registry. `npm pack` and `npm publish` each build their
+own archive, and the two can differ: npm runs `prepublishOnly` for
+`publish` and not for `pack`, so a project generating content in that
+hook ships files a separately packed tarball never contained. Handing
+npm the packed archive removes the second pack, which makes an
+attestation over that archive describe what actually published.
+
+Three consequences follow from the tarball being the artefact:
+
+- **The action skips the version stamp.** The archive already carries
+  its version, and rewriting the working tree would change a manifest
+  nothing reads. The action instead reads the version out of the
+  tarball and requires it to equal `publish_version`, so a stale
+  archive cannot publish under a version the caller never asked for.
+- **npm runs no lifecycle scripts.** It gates `prepack`, `prepare`,
+  `prepublishOnly`, `publish` and `postpublish` on packing a
+  directory. Removing the second pack is the point, and losing
+  `prepublishOnly` is how the two archives stop diverging — but a
+  project relying on `postpublish` needs another home for that work.
+- **`path_prefix` still matters.** npm resolves configuration and
+  credentials from the working directory, so it keeps pointing at the
+  project.
+
+`tarball_path` follows the same rules as `path_prefix`: relative
+values resolve against `GITHUB_WORKSPACE`, and the resolved path must
+stay inside it. The action resolves the path before it inspects the
+file, so a symlink counts as its target rather than its own location.
+
 ## Path Constraints
 
 Relative values for `path_prefix` resolve against `GITHUB_WORKSPACE`,
@@ -280,10 +326,16 @@ touches the path. Paths that escape the workspace fail the action.
   naming the skipped scripts, because a dependency-free `version`
   hook (writing the version into a source constant, say) would
   otherwise go missing from the published package with no signal
-- Publishing runs `prepublishOnly`/`prepack`/`prepare` scripts when
-  the project defines them; run builds beforehand (for example via
+- Publishing a directory runs `prepublishOnly`/`prepack`/`prepare`
+  scripts when the project defines them; run builds beforehand (for
+  example via
   [node-build-action](https://github.com/lfreleng-actions/node-build-action))
   so the packed content is complete
+- Publishing a tarball runs **no** lifecycle scripts at all. npm gates
+  `prepack`, `prepare`, `prepublishOnly`, `publish` and `postpublish`
+  on packing a directory, so a project relying on any of them — a
+  `postpublish` notification, say — needs another home for that work
+  under `tarball_path`
 
 ## Development
 
