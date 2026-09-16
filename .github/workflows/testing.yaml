@@ -1222,3 +1222,263 @@ jobs:
           echo "Metadata parsed correctly despite hook output ✅"
           echo "Metadata parsed correctly despite hook output ✅" \
             >> "$GITHUB_STEP_SUMMARY"
+
+  test-tarball-publish:
+    name: "Test: publishing a pre-packed tarball"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    steps:
+      # Load the egress allow-list out-of-band from the
+      # organisation's .github repository and publish it as
+      # $CONNECTION_ALLOW_LIST for the harden-runner step below.
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@805eedb0508c07714b61887a2b87a5c4bbeff22a # v0.12.1
+        with:
+          config: '@807a544b7e55a9224b2b3780e636467bd4b5b99b' # v0.5.0
+
+      # Harden the runner with the just-loaded allow-list.
+      - name: "Harden runner (block)"
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Checkout repository"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Two packages, deliberately different. The tarball is packed
+      # from 'packed' while the action points path_prefix at 'project',
+      # so a run that ignored tarball_path and packed the directory
+      # would report the wrong name and version rather than passing by
+      # coincidence.
+      - name: "Build a decoy project and a separate tarball"
+        shell: bash
+        run: |
+          # Build a decoy project and a separate tarball
+          mkdir -p project packed
+          cat > project/package.json <<'JSON'
+          {"name":"decoy-project","version":"0.0.1","license":"Apache-2.0"}
+          JSON
+          cat > packed/package.json <<'JSON'
+          {"name":"packed-package","version":"3.2.1","license":"Apache-2.0"}
+          JSON
+          ( cd packed && npm pack --pack-destination .. )
+          ls -1 ./*.tgz
+
+      - name: "Running local action: publish the packed tarball"
+        id: publish
+        uses: ./
+        with:
+          path_prefix: project
+          tarball_path: packed-package-3.2.1.tgz
+          publish_version: '3.2.1'
+          node_version: '22'
+          dry_run: 'true'
+
+      - name: "Verify the tarball published, not the directory"
+        shell: bash
+        env:
+          PUBLISHED_VERSION: ${{ steps.publish.outputs.published_version }}
+          PACKAGE_NAME: ${{ steps.publish.outputs.package_name }}
+          TARBALL_NAME: ${{ steps.publish.outputs.tarball_name }}
+        run: |
+          # Verify the tarball published, not the directory
+          errors=0
+          if [ "${PACKAGE_NAME}" != "packed-package" ]; then
+            echo "Published '${PACKAGE_NAME}', expected the tarball ❌"
+            errors=1
+          fi
+          if [ "${PUBLISHED_VERSION}" != "3.2.1" ]; then
+            echo "Published version '${PUBLISHED_VERSION}' ❌"
+            errors=1
+          fi
+          if [ "${TARBALL_NAME}" != "packed-package-3.2.1.tgz" ]; then
+            echo "Reported tarball '${TARBALL_NAME}' ❌"
+            errors=1
+          fi
+          # The decoy must be untouched. Publishing it would show up
+          # above, but the stamp is a separate failure: skipping it is
+          # what keeps the published bytes identical to the attested
+          # ones, so assert the manifest was not rewritten.
+          decoy="$(jq -r '.version // empty' project/package.json)"
+          if [ "${decoy}" != "0.0.1" ]; then
+            echo "The stamp ran and rewrote the project ❌"
+            echo "project/package.json version: ${decoy}"
+            errors=1
+          fi
+          if [ "${errors}" != "0" ]; then
+            echo "Pre-packed tarball publish failed ❌" \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Pre-packed tarball published, stamp skipped ✅"
+          echo "Pre-packed tarball published, stamp skipped ✅" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      # The rejections run against the shipped validate step rather
+      # than a copy, so renaming or reordering it fails loudly here
+      # instead of silently testing nothing.
+      - name: "Exercise every tarball_path rejection"
+        shell: bash
+        run: |
+          # Exercise every tarball_path rejection
+          validate="${RUNNER_TEMP}/validate.sh"
+          python3 - <<'EXTRACT' > "${validate}"
+          import sys
+          import yaml
+
+          with open('action.yaml') as handle:
+              doc = yaml.safe_load(handle)
+          steps = doc['runs']['steps']
+          match = [s for s in steps if s.get('id') == 'validate']
+          if not match:
+              sys.exit("no step with id 'validate' in action.yaml")
+          sys.stdout.write(match[0]['run'])
+          EXTRACT
+          if ! grep -q 'INPUT_TARBALL_PATH' "${validate}"; then
+            echo "Could not extract the validate step ❌"
+            echo "Update the extraction in this job to match"
+            exit 1
+          fi
+
+          mkdir -p "${GITHUB_WORKSPACE}/tbcase"
+          cp packed-package-3.2.1.tgz "${GITHUB_WORKSPACE}/tbcase/ok.tgz"
+          cp packed-package-3.2.1.tgz "${GITHUB_WORKSPACE}/tbcase/wrong.txt"
+          printf 'not a tarball' > "${GITHUB_WORKSPACE}/tbcase/broken.tgz"
+          # An archive whose package.json is not valid JSON, and one
+          # whose manifest parses but declares no version. Both reach
+          # branches no other case covers.
+          mkdir -p "${RUNNER_TEMP}/bad/package"
+          printf '{ not json' \
+            > "${RUNNER_TEMP}/bad/package/package.json"
+          tar -czf "${GITHUB_WORKSPACE}/tbcase/badjson.tgz" \
+            -C "${RUNNER_TEMP}/bad" package
+          mkdir -p "${RUNNER_TEMP}/nover/package"
+          printf '{"name":"no-version"}' \
+            > "${RUNNER_TEMP}/nover/package/package.json"
+          tar -czf "${GITHUB_WORKSPACE}/tbcase/noversion.tgz" \
+            -C "${RUNNER_TEMP}/nover" package
+          mkdir -p "${GITHUB_WORKSPACE}/tbcase/adir"
+          # A directory whose name ends in .tgz clears the extension
+          # check, so only the file-type test can reject it. Without
+          # this case that test is dead weight, and the failure it
+          # prevents -- tar reporting a confusing error on a directory
+          # -- would reach the caller instead.
+          mkdir -p "${GITHUB_WORKSPACE}/tbcase/dir.tgz"
+          # A real file outside the workspace, so the boundary check is
+          # what rejects it rather than the path failing to resolve
+          outside="$(mktemp -d)"
+          cp packed-package-3.2.1.tgz "${outside}/escape.tgz"
+          ln -sf "${outside}/escape.tgz" \
+            "${GITHUB_WORKSPACE}/tbcase/symlink.tgz"
+
+          # The runner invokes a 'shell: bash' step as
+          # 'bash --noprofile --norc -eo pipefail', so the extracted
+          # step runs the same way below. Plain 'bash' would drop
+          # pipefail and let this job disagree with CI about whether a
+          # pipeline inside the step failed.
+          errors=0
+          # $1 label, $2 tarball_path, $3 publish_version, $4 want,
+          # $5 optional substring the rejection message must contain
+          check() {
+            local label="$1" path="$2" version="$3" want="$4"
+            local want_msg="${5:-}"
+            set +e
+            out="$(env \
+              INPUT_PUBLISH_VERSION="${version}" INPUT_REGISTRY_URL='' \
+              INPUT_DRY_RUN=true INPUT_PATH_PREFIX=project \
+              INPUT_TARBALL_PATH="${path}" INPUT_NODE_VERSION=22 \
+              INPUT_NODE_VERSION_FILE='' INPUT_TAG=latest \
+              INPUT_ACCESS='' INPUT_PROVENANCE=false \
+              INPUT_LOAD_CREDENTIAL=false INPUT_NEXUS_USER='' \
+              INPUT_NEXUS_PASSWORD='' INPUT_AUTH_TOKEN='' \
+              INPUT_VAULT_MAPPING_JSON='' \
+              INPUT_OP_SERVICE_ACCOUNT_TOKEN='' \
+              GITHUB_OUTPUT="${RUNNER_TEMP}/tbout.txt" \
+              bash --noprofile --norc -eo pipefail "${validate}" 2>&1)"
+            rc=$?
+            set -e
+            if [ "${want}" = 'accept' ]; then
+              if [ "${rc}" != "0" ]; then
+                echo "${label}: expected acceptance, got rc=${rc} ❌"
+                printf '%s\n' "${out}" | tail -3
+                errors=1
+              fi
+              return
+            fi
+            if [ "${rc}" = "0" ]; then
+              echo "${label}: expected rejection, validate passed ❌"
+              errors=1
+              return
+            fi
+            if ! printf '%s' "${out}" | grep -q '❌'; then
+              echo "${label}: rejected without a labelled error ❌"
+              errors=1
+            fi
+            # Several checks reject the same input, so a bare rejection
+            # does not show which one fired. Where the message matters,
+            # assert it: otherwise the earlier, clearer check can be
+            # deleted and every case still passes.
+            if [ -n "${want_msg}" ] \
+              && ! printf '%s' "${out}" | grep -qF "${want_msg}"; then
+              echo "${label}: expected message '${want_msg}' ❌"
+              printf '%s\n' "${out}" | tail -3
+              errors=1
+            fi
+          }
+
+          : > "${RUNNER_TEMP}/tbout.txt"
+          check 'valid tarball' 'tbcase/ok.tgz' '3.2.1' accept
+          check 'version mismatch' 'tbcase/ok.tgz' '9.9.9' reject
+          check 'wrong extension' 'tbcase/wrong.txt' '3.2.1' reject
+          check 'missing file' 'tbcase/nope.tgz' '3.2.1' reject
+          check 'directory' 'tbcase/adir' '3.2.1' reject \
+            'tarball_path is not a file'
+          check 'directory named .tgz' 'tbcase/dir.tgz' '3.2.1' reject \
+            'tarball_path is not a file'
+          check 'not an npm archive' 'tbcase/broken.tgz' '3.2.1' reject \
+            'cannot read package.json from the tarball'
+          check 'manifest is not JSON' 'tbcase/badjson.tgz' '3.2.1' \
+            reject 'not valid'
+          check 'manifest has no version' 'tbcase/noversion.tgz' '3.2.1' \
+            reject 'declares no version'
+          check 'absolute escape' "${outside}/escape.tgz" '3.2.1' reject
+          check 'relative escape' '../escape.tgz' '3.2.1' reject
+          check 'symlink escape' 'tbcase/symlink.tgz' '3.2.1' reject
+          # A value ending in a newline must be refused on the raw
+          # input. realpath's output loses trailing newlines, so were
+          # this checked after resolving, the value would silently
+          # become the newline-free sibling -- validating one file and
+          # publishing another.
+          #
+          # Built with $'...' rather than "$(printf ...)", because
+          # command substitution strips the very newline under test.
+          # The message assertion is what gives this teeth: without
+          # the check the path merely fails to resolve, which is a
+          # different error and would otherwise look like a pass.
+          newline_path=$'tbcase/ok.tgz\n'
+          check 'trailing newline' "${newline_path}" '3.2.1' reject \
+            'line break'
+          # Empty keeps the packing path, and must not emit a tarball
+          check 'empty means pack' '' '3.2.1' accept
+          resolved="$(grep '^tarball=' "${RUNNER_TEMP}/tbout.txt" \
+            | tail -1 | cut -d= -f2-)"
+          if [ -n "${resolved}" ]; then
+            echo "Empty tarball_path resolved to '${resolved}' ❌"
+            errors=1
+          fi
+
+          if [ "${errors}" != "0" ]; then
+            echo "tarball_path rejection tests failed ❌" \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Every tarball_path rejection behaved ✅"
+          echo "Every tarball_path rejection behaved ✅" \
+            >> "$GITHUB_STEP_SUMMARY"
