@@ -141,11 +141,11 @@ runs:
         # Validate inputs
         # Preflight: fail with a clear message when required tools are
         # missing (possible on minimal self-hosted runners)
-        for tool in jq realpath mktemp tr tar; do
+        for tool in jq realpath mktemp tr tar cp; do
           if ! command -v "${tool}" > /dev/null 2>&1; then
             echo "Error: required tool not found: ${tool} ❌"
             echo "This action requires jq, realpath (GNU coreutils,"
-            echo "including -m), mktemp, tr and tar on the runner"
+            echo "including -m), mktemp, tr, tar and cp on the runner"
             exit 1
           fi
         done
@@ -544,6 +544,47 @@ runs:
           # no version" branch below and report the wrong cause.
           # Splitting them also means this does not depend on the
           # caller's pipefail setting to be correct.
+          # Copy the archive out of the workspace *before* reading it,
+          # and validate the copy.
+          #
+          # Every check below opens the archive, and so does npm publish
+          # later. On the workspace path each open is a fresh chance to
+          # substitute the file, and no digest taken around a read can
+          # close that: a swap during the read and a swap back before the
+          # hash makes both hashes agree while the manifest came from the
+          # other archive. Copying first removes the race rather than
+          # narrowing it -- the bytes validated are the bytes published,
+          # because they are the same file.
+          #
+          # RUNNER_TEMP sits outside the checked-out tree, so repository
+          # content cannot reach it.
+          staging="$(mktemp -d "${RUNNER_TEMP:?}/npmstage.XXXXXX")"
+          # Remove it again if this step does not reach the end. The
+          # final always() step keys off the tarball output, which is
+          # written only on success, so a failure between here and there
+          # would otherwise leave the directory on a runner that keeps
+          # RUNNER_TEMP. Cleared after the outputs are written, so the
+          # successful path hands the directory to that step instead.
+          trap 'rm -rf -- "${staging}"' EXIT
+          staged="${staging}/package.tgz"
+          # -P copies a symlink as a symlink instead of following it. The
+          # boundary check above resolved the path, but the file at that
+          # path is still repository content and can be replaced between
+          # the check and this open -- by a symlink pointing outside the
+          # workspace, which a following cp would silently read. With -P
+          # the swap yields a symlink in the staging directory, which the
+          # test below refuses. The bytes staged are therefore either the
+          # regular file that was there, or nothing.
+          if ! cp -P -- "${tarball}" "${staged}"; then
+            echo "Error: cannot stage the tarball ❌"
+            exit 1
+          fi
+          if [ -L "${staged}" ] || [ ! -f "${staged}" ]; then
+            echo "Error: the tarball was replaced while being staged ❌"
+            exit 1
+          fi
+          tarball="${staged}"
+
           if ! tarball_manifest="$(tar -xzOf "${tarball}" \
             package/package.json 2>/dev/null)"; then
             echo "Error: cannot read package.json from the tarball ❌"
@@ -580,6 +621,10 @@ runs:
         # rather than as given, so the publish step consumes the path
         # this step actually checked.
         echo "tarball=${tarball}" >> "$GITHUB_OUTPUT"
+        # Only now hand the staged directory to the cleanup step. That
+        # step keys off the tarball output, so clearing the trap before
+        # this write would strand the archive if the write itself failed.
+        trap - EXIT
 
     - name: "Setup Node.js"
       # yamllint disable-line rule:line-length
@@ -592,12 +637,100 @@ runs:
     # it skips the credential machinery entirely. For real publishes
     # the npmrc action writes the authenticated .npmrc and registers
     # a guaranteed post-job step that scrubs it again
+    - name: "Resolve the effective registry"
+      id: registry
+      shell: bash
+      env:
+        PROJECT_DIR: ${{ inputs.path_prefix }}
+        REGISTRY_URL: ${{ inputs.registry_url }}
+        # The validated tarball, when publishing a pre-packed archive.
+        # npm resolves the publish from the manifest inside it, so its
+        # scope and publishConfig decide the registry -- not the
+        # working directory's.
+        TARBALL: ${{ steps.validate.outputs.tarball }}
+      run: |
+        # Resolve the effective registry
+        # Anchor relative paths to GITHUB_WORKSPACE and re-enforce the
+        # workspace boundary at the point of use (TOCTOU), as the
+        # stamp, publish and verify steps do. This step reads a
+        # package.json and npm configuration from the directory, so a
+        # swapped symlink would resolve the registry from a project
+        # outside the workspace. Fail closed on realpath failure: an
+        # empty result would degrade the case pattern below to /* and
+        # accept any path
+        case "${PROJECT_DIR}" in
+          /*) ;;
+          *) PROJECT_DIR="${GITHUB_WORKSPACE:?}/${PROJECT_DIR}" ;;
+        esac
+        if ! PROJECT_DIR="$(realpath -- "${PROJECT_DIR}")" || \
+          [ -z "${PROJECT_DIR}" ]; then
+          echo "Error: cannot resolve project directory ❌"
+          exit 1
+        fi
+        if ! boundary="$(realpath -- "${GITHUB_WORKSPACE:?}")" || \
+          [ -z "${boundary}" ]; then
+          echo "Error: cannot resolve GITHUB_WORKSPACE ❌"
+          exit 1
+        fi
+        case "${PROJECT_DIR}/" in
+          "${boundary}/"*) ;;
+          *)
+            echo "Error: project directory escapes the workspace ❌"
+            echo "path_prefix must resolve within GITHUB_WORKSPACE"
+            exit 1 ;;
+        esac
+        # The tarball needs no boundary check here: validate staged the
+        # validated bytes into RUNNER_TEMP, outside the checked-out
+        # tree, so this is not a path repository content can reach.
+        # Confirmed to be under RUNNER_TEMP rather than trusted, since
+        # the value still crossed a step boundary.
+        if [ -n "${TARBALL}" ]; then
+          case "${TARBALL}" in
+            "${RUNNER_TEMP:?}"/*) ;;
+            *)
+              echo "Error: the tarball is not the staged copy ❌"
+              exit 1 ;;
+          esac
+          if [ ! -f "${TARBALL}" ]; then
+            echo "Error: the staged tarball is missing ❌"
+            exit 1
+          fi
+        fi
+        # This is the first bundled program the action runs, so the
+        # runtime check that used to guard the publish step belongs
+        # here now. A node_version too old to load the bundle would
+        # otherwise surface as a raw syntax or module error, instead of
+        # naming the input that needs raising -- and it would do so
+        # before the publish rather than after, which is the one mercy
+        # of the original placement.
+        if ! node \
+          "${GITHUB_ACTION_PATH}/dist/resolve-registry/index.js" \
+          --selftest; then
+          echo "::error::The selected Node.js cannot run this action's" \
+            "bundled programs. Raise node_version, or the version in" \
+            "the file named by node_version_file, to a release this" \
+            "action supports."
+          exit 1
+        fi
+        PROJECT_DIR="${PROJECT_DIR}" TARBALL="${TARBALL}" \
+          node "${GITHUB_ACTION_PATH}/dist/resolve-registry/index.js"
+
     - name: "Create authenticated .npmrc"
       if: inputs.dry_run != 'true'
       # yamllint disable-line rule:line-length
       uses: lfreleng-actions/node-create-npmrc-action@e0ff8adfc0591c86d8d07828bffab10f43096155 # v0.2.0
       with:
-        registry_url: ${{ inputs.registry_url }}
+        # The resolved registry, not the raw input. This action writes a
+        # credential keyed to the registry URL, and it replaces the
+        # project's .npmrc rather than merging with it -- so keying it to
+        # registry_url while npm publishes somewhere a publishConfig
+        # override selected leaves that destination with no credential,
+        # and the publish fails with a 401.
+        #
+        # Resolution runs before this step for the same reason: the
+        # project's own .npmrc is one of the sources it reads, and this
+        # step overwrites it.
+        registry_url: ${{ steps.registry.outputs.registry }}
         nexus_user: ${{ inputs.nexus_user }}
         nexus_password: ${{ inputs.nexus_password }}
         auth_token: ${{ inputs.auth_token }}
@@ -606,6 +739,18 @@ runs:
         op_service_account_token: ${{ inputs.op_service_account_token }}
         scope: ${{ inputs.scope }}
         path: ${{ inputs.path_prefix }}
+
+    # Placed before the .npmrc step, which replaces the project's own
+    # file rather than merging with it -- so resolving afterwards would
+    # read the credential file this action just wrote instead of the
+    # configuration the project ships, and miss a scoped registry set
+    # there. The resolved value is then fed to that step, so the
+    # credential is keyed to the registry npm will actually use.
+    #
+    # A scoped package can redirect its own publish, and until now the
+    # action reported and verified against registry_url regardless -- so
+    # a successful publish could be "verified" against a registry it
+    # never reached.
 
     - name: "Stamp version into package.json"
       id: stamp
@@ -738,7 +883,10 @@ runs:
         ACCESS: ${{ inputs.access }}
         PROVENANCE: ${{ inputs.provenance }}
         TARBALL: ${{ steps.validate.outputs.tarball }}
-        REGISTRY_URL: ${{ inputs.registry_url }}
+        REGISTRY_URL: ${{ steps.registry.outputs.registry }}
+        # Pins every consulted scope at publish time; see the run body.
+        # yamllint disable-line rule:line-length
+        REGISTRY_SCOPES: ${{ steps.registry.outputs.registry_scopes }}
       run: |
         # Publish package
         # Anchor relative paths to GITHUB_WORKSPACE and re-enforce
@@ -785,60 +933,20 @@ runs:
         # still applies for credential resolution without affecting
         # which file publishes.
         if [ -n "${TARBALL}" ]; then
-          # Re-resolve and re-check at the point of use, for the same
-          # reason PROJECT_DIR does above: the workspace is mutable
-          # between steps, so a file validated earlier can have been
-          # replaced by an escaping symlink or a different archive.
-          # Fail closed on realpath failure. The sentinel preserves a
-          # newline belonging to the filename, as in the validate step.
-          if ! resolved="$(realpath -- "${TARBALL}" && printf 'x')"; then
-            echo "Error: cannot resolve the tarball ❌"
-            exit 1
-          fi
-          resolved="${resolved%x}"
-          TARBALL="${resolved%$'\n'}"
-          if [ -z "${TARBALL}" ]; then
-            echo "Error: cannot resolve the tarball ❌"
-            exit 1
-          fi
+          # npm opens this path itself, so no check here can be atomic
+          # with that open. The archive is therefore the staged copy in
+          # RUNNER_TEMP rather than the workspace path: validate put the
+          # validated bytes somewhere repository content cannot reach,
+          # which is what makes the version, identity and registry this
+          # publish relies on the ones that were checked.
           case "${TARBALL}" in
-            *$'\n'*|*$'\r'*)
-              echo "Error: resolved tarball path contains a line" \
-                "break ❌"
-              exit 1 ;;
-          esac
-          case "${TARBALL}/" in
-            "${boundary}/"*) ;;
+            "${RUNNER_TEMP:?}"/*) ;;
             *)
-              echo "Error: tarball escapes the workspace ❌"
+              echo "Error: the tarball is not the staged copy ❌"
               exit 1 ;;
           esac
           if [ ! -f "${TARBALL}" ]; then
-            echo "Error: tarball is no longer a file ❌"
-            exit 1
-          fi
-          # Re-read the version too. The boundary checks above stop a
-          # swap for content outside the workspace; they say nothing
-          # about a different archive appearing inside it, which is
-          # exactly the substitution that would publish bytes nobody
-          # attested.
-          if ! manifest="$(tar -xzOf "${TARBALL}" \
-            package/package.json 2>/dev/null)"; then
-            echo "Error: cannot read package.json from the tarball ❌"
-            exit 1
-          fi
-          if ! version="$(printf '%s' "${manifest}" \
-            | jq -r '.version // empty' 2>/dev/null)"; then
-            echo "Error: package.json in the tarball is not valid" \
-              "JSON ❌"
-            exit 1
-          fi
-          if [ "${version}" != "${PUBLISH_VERSION}" ]; then
-            echo "Error: the tarball changed since validation ❌"
-            printf 'tarball:         %s\n' \
-              "$(printf '%s' "${version}" | tr -d '\r\n')"
-            printf 'publish_version: %s\n' \
-              "$(printf '%s' "${PUBLISH_VERSION}" | tr -d '\r\n')"
+            echo "Error: the staged tarball is missing ❌"
             exit 1
           fi
           set -- publish "${TARBALL}" --json --tag "${TAG}"
@@ -859,15 +967,81 @@ runs:
         if [ "${PROVENANCE}" = "true" ]; then
           set -- "$@" --provenance
         fi
+        # --registry applies to a dry run as well. npm still queries the
+        # selected registry for existing metadata, so omitting it sent
+        # the lookup to npm's default while the summary named the
+        # resolved one -- reporting a registry the run never touched.
+        if [ -n "${REGISTRY_URL}" ]; then
+          set -- "$@" --registry "${REGISTRY_URL}"
+          # Pin the scoped key too, which makes the resolved value
+          # authoritative rather than a prediction.
+          #
+          # npm re-reads the manifest and flattens publishConfig again
+          # after prepublishOnly has run, so for a directory publish a
+          # script can add publishConfig["@scope:registry"] and redirect
+          # the publish *after* this was resolved -- leaving the summary
+          # and the verification on a registry nothing used. npm filters
+          # any publishConfig key already supplied on the command line,
+          # so supplying this one closes that window: verified against
+          # npm 11.19.0, where --@scope:registry beat the manifest.
+          #
+          # This does not override the project's intent. The value being
+          # pinned is the one resolved from the project's own manifest
+          # and configuration; pinning only stops it moving afterwards.
+          # Read line by line, not word by word: a scope may contain
+          # whitespace and npm honours it. A herestring rather than a
+          # pipe, because a pipe would run the loop in a subshell and
+          # the arguments would not survive it.
+          while IFS= read -r scope; do
+            [ -n "${scope}" ] || continue
+            set -- "$@" "--${scope}:registry=${REGISTRY_URL}"
+          done <<< "${REGISTRY_SCOPES}"
+        fi
         if [ "${DRY_RUN}" = "true" ]; then
           set -- "$@" --dry-run
           echo "Publishing in dry-run mode (packs and reports only;" \
             "npm performs no publish)"
-        else
-          set -- "$@" --registry "${REGISTRY_URL}"
         fi
 
         cd "${PROJECT_DIR}" || exit 1
+
+        # Warn when a directory publish defines a hook that can rewrite
+        # the manifest npm rereads.
+        #
+        # The pins above fix the registry for every scope known now. A
+        # prepack, prepare or prepublishOnly script runs inside npm
+        # publish and can introduce a scope that did not exist when the
+        # pins were built -- by renaming the package, or by setting
+        # publishConfig.scope alongside a matching @scope:registry key
+        # -- which npm then consults ahead of them.
+        #
+        # Checked before publishing rather than after. The post-publish
+        # manifest cannot answer this: postpublish may restore a name
+        # prepublishOnly changed, hiding it, or change one itself,
+        # inventing a mismatch that never reached the registry. npm own
+        # JSON reports the manifest it read *before* those hooks ran.
+        # So this reports what is knowable -- that the risk exists --
+        # and how to remove it.
+        #
+        # A notice, not a failure: these hooks are ordinary and most do
+        # not touch the name.
+        if [ -z "${TARBALL}" ] && [ -f package.json ]; then
+          hooks="$(jq -r '[(.scripts // {}) | keys[]
+            | select(. == "prepack" or . == "prepare"
+                     or . == "prepublishOnly")] | join(", ")' \
+            package.json)"
+          if [ -n "${hooks}" ]; then
+            echo "::notice::This publish runs lifecycle script(s):" \
+              "${hooks}. They execute inside npm publish, after the" \
+              "registry was resolved, so one that changes the package" \
+              "name or publishConfig.scope can select a scoped registry" \
+              "these pins do not cover -- leaving the summary and" \
+              "verification describing another destination. Pack first" \
+              "and publish through" \
+              "tarball_path to remove the possibility; a tarball" \
+              "publish runs no lifecycle scripts."
+          fi
+        fi
 
         # The parser below runs on the Node.js that node_version or
         # node_version_file selected, which can sit below what the
@@ -911,6 +1085,7 @@ runs:
         PUBLISH_EXIT_CODE="${publish_exit}" \
           node "${GITHUB_ACTION_PATH}/dist/parse-publish-output/index.js"
 
+
     # Best-effort registry confirmation for real publishes: some
     # registries restrict anonymous reads or index asynchronously, so
     # an unreadable package downgrades to a warning; a readable
@@ -922,7 +1097,11 @@ runs:
         PROJECT_DIR: ${{ inputs.path_prefix }}
         PACKAGE_NAME: ${{ steps.publish.outputs.package_name }}
         PUBLISHED_VERSION: ${{ steps.publish.outputs.published_version }}
-        REGISTRY_URL: ${{ inputs.registry_url }}
+        REGISTRY_URL: ${{ steps.registry.outputs.registry }}
+        # Every scope npm would consult. Needed because --registry does
+        # not outrank a scoped setting.
+        # yamllint disable-line rule:line-length
+        REGISTRY_SCOPES: ${{ steps.registry.outputs.registry_scopes }}
       run: |
         # Verify publication on registry
         # Anchor relative paths to GITHUB_WORKSPACE and re-enforce
@@ -963,9 +1142,28 @@ runs:
         # Run from the project directory so the authenticated .npmrc
         # written by node-create-npmrc-action applies
         cd "${PROJECT_DIR}" || exit 1
+        # --registry alone does not decide where this looks. npm's
+        # pickRegistry prefers a scoped setting over it, so for a
+        # scoped package a project @scope:registry would send this
+        # query somewhere other than the registry the publish reached
+        # -- checking the wrong host while appearing to honour the
+        # resolved value. Setting the scoped key on the command line
+        # puts the resolved registry where pickRegistry looks first.
+        #
+        # Authentication is unaffected: npm keys credentials by the
+        # registry URL, and this forces the one the publish used.
+        set -- "${PACKAGE_NAME}@${PUBLISHED_VERSION}" version \
+          --registry "${REGISTRY_URL}"
+        # Every consulted scope, not only the one that decided. npm view
+        # does not load publishConfig, so a key the manifest masked is
+        # live again here and would outrank both --registry and a pin on
+        # the winning scope alone.
+        while IFS= read -r scope; do
+          [ -n "${scope}" ] || continue
+          set -- "$@" "--${scope}:registry=${REGISTRY_URL}"
+        done <<< "${REGISTRY_SCOPES}"
         set +e
-        seen="$(npm view "${PACKAGE_NAME}@${PUBLISHED_VERSION}" \
-          version --registry "${REGISTRY_URL}" 2>/dev/null)"
+        seen="$(npm view "$@" 2>/dev/null)"
         view_exit=$?
         set -e
         if [ "${view_exit}" != "0" ]; then
@@ -987,3 +1185,36 @@ runs:
         echo "Registry confirmed" \
           "${PACKAGE_NAME}@${PUBLISHED_VERSION} ✅" \
           >> "$GITHUB_STEP_SUMMARY"
+
+    # The staged archive has to outlive the step that made it, because
+    # the registry resolution and the publish both read it -- so it
+    # cannot use the EXIT trap pattern the publish scratch directory
+    # does. It is removed here instead.
+    #
+    # always(), because a failed publish leaves the archive behind just
+    # as a successful one does, and RUNNER_TEMP is not guaranteed to be
+    # cleaned between runs on a self-hosted runner. A complete package
+    # archive per publish would accumulate there indefinitely.
+    - name: "Remove the staged tarball"
+      if: always() && steps.validate.outputs.tarball != ''
+      shell: bash
+      env:
+        STAGED: ${{ steps.validate.outputs.tarball }}
+      run: |
+        # Remove the staged tarball
+        # Refuse to delete anything that is not this action's own
+        # staging directory. The value crossed a step boundary, and a
+        # recursive delete driven by an unchecked path is worth being
+        # paranoid about even when the source is trusted.
+        case "${STAGED}" in
+          "${RUNNER_TEMP:?}"/npmstage.*/package.tgz) ;;
+          *)
+            echo "::warning::Not removing ${STAGED}: it is not a staged" \
+              "tarball path"
+            exit 0 ;;
+        esac
+        # The case above fixed the shape, so the parent is everything
+        # before the last '/'. Parameter expansion rather than dirname,
+        # to avoid adding another tool to the preflight contract for a
+        # step that runs after a successful publish.
+        rm -rf -- "${STAGED%/*}"

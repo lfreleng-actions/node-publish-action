@@ -51,8 +51,9 @@ steps:
 ## Requirements
 
 The action needs `jq`, `realpath` (GNU coreutils, including `-m`
-support), `mktemp`, `tr` and `tar` on the runner. GitHub-hosted Ubuntu
-runners include these tools; minimal self-hosted or non-Linux runners
+support), `mktemp`, `tr`, `tar` and `cp` on the runner.
+GitHub-hosted Ubuntu runners include these tools; minimal self-hosted
+or non-Linux runners
 must provide them. The action checks for them up front and fails with
 a clear error naming any missing tool. It installs Node.js and npm via
 the pinned `actions/setup-node` action, without dependency caching.
@@ -124,23 +125,29 @@ The `nexus_user`, `scope` and credential inputs pass through to
    failing fast with a clear error otherwise. With
    `load_credential: 'true'`, real publishes need non-empty
    `vault_mapping_json` and `op_service_account_token` values too
-2. **Authenticate** (real publishes): `node-create-npmrc-action`
-   writes an authenticated `.npmrc` into the project directory
-3. **Stamp**: `npm version <X> --no-git-tag-version
+2. **Resolve the registry**: works out where npm will actually publish,
+   which a scoped package can redirect away from `registry_url`. See
+   [Effective Registry](#effective-registry). This runs before
+   authentication because the next step replaces the project's `.npmrc`,
+   one of the files resolution reads
+3. **Authenticate** (real publishes): `node-create-npmrc-action`
+   writes an authenticated `.npmrc` into the project directory, keyed
+   to the resolved registry
+4. **Stamp**: `npm version <X> --no-git-tag-version
    --allow-same-version --ignore-scripts --no-workspaces` updates
    `package.json`, with the result read back and verified. A
    `::notice::` names any `preversion`/`version`/`postversion`
    scripts the project defines, since `--ignore-scripts` means they
    do not run. **Skipped entirely with `tarball_path`**, where the
    archive already carries the version
-4. **Publish**: `npm publish --json --no-workspaces` with the
+5. **Publish**: `npm publish --json --no-workspaces` with the
    configured tag, access and provenance flags, packing the project
    directory — or `npm publish <tarball>` when `tarball_path` names
    an archive, which packs nothing. The action then
    recovers npm's metadata from the captured output and checks the
    published version against the request. See
    [Publish Output Parsing](#publish-output-parsing)
-5. **Verify** (real publishes): `npm view <name>@<version>` against
+6. **Verify** (real publishes): `npm view <name>@<version>` against
    the target registry confirms availability; an unreadable package
    downgrades to a warning (registries may restrict anonymous reads
    or index asynchronously), while a readable package with the wrong
@@ -261,6 +268,104 @@ with provenance support (npmjs.org) and requires an OIDC token
 leave the input at `false` for Nexus targets; generate GitHub
 artifact attestations for the packed tarball instead.
 
+## Effective Registry
+
+`registry_url` names where the action *asks* npm to publish. npm does
+not always agree, and the action now resolves the difference instead
+of assuming it away.
+
+npm picks the registry with `pickRegistry`, which prefers a scoped
+setting and flattens a package's `publishConfig` over the resolved
+options — except for keys already supplied on the command line, which
+npm filters out. The search order is:
+
+1. `publishConfig["@scope:registry"]`, for the package's own scope
+2. `@scope:registry` from npm configuration (`.npmrc`)
+3. the same two keys again for the configured scope — `publishConfig`'s
+   `scope` when the manifest has one, else npm's `scope` setting — which
+   redirects packages that are not themselves scoped
+4. `registry_url`
+
+`publishConfig.registry` is **not** in that list. npm filters it out
+whenever this action passes `--registry`, which leaves one case where
+it decides: a dry run with an empty `registry_url`, where the action
+passes no registry at all. Honouring it elsewhere would redirect a
+publish npm would have sent to the caller's registry.
+
+A `publishConfig` key that is present but empty still counts: npm
+flattens it over the resolved options, so it masks any `.npmrc` value
+for the same key and the search moves past both.
+
+I checked each of these against npm 11.19.0 rather than reading the
+source alone.
+
+With `tarball_path`, the manifest consulted is the one **inside the
+archive**, because that is the one npm reads: a tarball's scope and
+`publishConfig` decide its registry, and the working directory's
+manifest never takes part in the publish.
+
+Before this resolution the publish went to the right place — npm was
+always correct — but the action reported `registry_url` in the job
+summary and ran `npm view --registry "${registry_url}"` to verify. A
+redirected publish then either failed verification for no reason, or
+"verified" against a registry it never reached, which is a false
+confirmation where the name exists in both.
+
+The resolved value now drives the publish, the summary line and the
+verification alike — and the publish and verification commands **pin**
+it under *every* consulted scope as well as `--registry`. That turns a
+prediction into a guarantee: npm re-reads the manifest after
+`prepublishOnly` runs, so a script adding the scoped
+`publishConfig` key could otherwise redirect the publish once
+resolution had finished. Since npm filters any key supplied on the
+command line, supplying those keys closes the window. A pin on the
+winning scope alone leaves a gap, because `pickRegistry` checks the
+package's own scope first and `npm view` does not load `publishConfig`
+at all. An unpinned key can still claim the publish or the
+verification.
+
+The pinned value is the one resolved from the project's own files, so
+this fixes the destination rather than overriding the project's
+intent.
+
+One case a pin cannot cover: a lifecycle script that introduces a
+**new scope**. `prepack`, `prepare` and `prepublishOnly` run inside
+`npm publish`, and npm re-reads the manifest afterwards, so renaming
+`@old/pkg` to `@new/pkg` — or setting `publishConfig.scope` beside a
+matching `@new:registry` key — can select a registry no pin could have
+named in advance.
+
+Nothing can catch this after the fact either. `postpublish` may
+restore a name `prepublishOnly` changed, or change one itself, and
+npm's own JSON reports the manifest it read *before* the hooks. So a
+directory publish defining any of those scripts gets a notice saying
+the risk exists, rather than a check that would be wrong in both
+directions.
+
+Publishing through `tarball_path` removes the possibility entirely:
+npm runs no lifecycle scripts for a tarball, so the manifest cannot
+change underneath the resolution.
+
+When the resolved value differs from `registry_url` the action emits a
+notice naming the source, so an override is visible rather than
+silent:
+
+```text
+::notice::Publishing to https://registry.npmjs.org/, not the
+registry_url https://nexus3.example.org/repository/npm.release/.
+The project selects it through publishConfig-scoped.
+```
+
+An override gets the same scheme check as `registry_url`, which it had
+never had: it arrives from the project's own files, and under trusted
+publishing npm sends a token to whatever registry wins. A non-`https`
+override fails the action rather than redirecting the publish.
+
+The configuration half of the answer comes from `npm config get`, so
+this reads npm's resolution rather than parsing `.npmrc` itself. The
+manifest supplies `publishConfig`, because `npm config` does not load
+it at all — which is why this redirection was invisible.
+
 ## Publishing a Pre-Packed Tarball
 
 By default the action packs `path_prefix` at publish time. Set
@@ -289,6 +394,12 @@ Three consequences follow from the tarball being the artefact:
   nothing reads. The action instead reads the version out of the
   tarball and requires it to equal `publish_version`, so a stale
   archive cannot publish under a version the caller never asked for.
+  Validation copies the archive into `RUNNER_TEMP` **before** reading
+  it, validates the copy, and every later step uses that copy; a
+  final `always()` step removes it. No check around a read of the
+  workspace path could be atomic with that read, so the action moves
+  the bytes outside the checked-out tree first — the version, identity
+  and registry the publish relies on come from the file it publishes.
 - **npm runs no lifecycle scripts.** It gates `prepack`, `prepare`,
   `prepublishOnly`, `publish` and `postpublish` on packing a
   directory. Removing the second pack is the point, and losing

@@ -26,7 +26,10 @@ import { writeFileSync } from 'node:fs';
  */
 const NODE_TARGET = 'node18';
 
-const entryPoints = [{ in: 'src/bin/parse-publish-output.ts', outDir: 'dist/parse-publish-output' }];
+const entryPoints = [
+  { in: 'src/bin/parse-publish-output.ts', outDir: 'dist/parse-publish-output' },
+  { in: 'src/bin/resolve-registry.ts', outDir: 'dist/resolve-registry' },
+];
 
 for (const { in: entry, outDir } of entryPoints) {
   await build({
