@@ -1482,3 +1482,519 @@ jobs:
           echo "Every tarball_path rejection behaved ✅"
           echo "Every tarball_path rejection behaved ✅" \
             >> "$GITHUB_STEP_SUMMARY"
+
+  test-scoped-registry:
+    name: "Test: scoped registry overrides"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 15
+    steps:
+      # Load the egress allow-list out-of-band from the
+      # organisation's .github repository and publish it as
+      # $CONNECTION_ALLOW_LIST for the harden-runner step below.
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@805eedb0508c07714b61887a2b87a5c4bbeff22a # v0.12.1
+        with:
+          config: '@807a544b7e55a9224b2b3780e636467bd4b5b99b' # v0.5.0
+
+      # Harden the runner with the just-loaded allow-list.
+      - name: "Harden runner (block)"
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Checkout repository"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: "Set up Node.js"
+        # yamllint disable-line rule:line-length
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '22'
+
+      # The unit tests cover the selection rules. This exercises the
+      # halves they cannot: reading a real .npmrc through npm's own
+      # config resolution, and the committed bundle the action runs.
+      - name: "Resolve against real npm configuration"
+        shell: bash
+        run: |
+          # Resolve against real npm configuration
+          resolver="${GITHUB_WORKSPACE}/dist/resolve-registry/index.js"
+          input='https://nexus3.example.org/repository/npm.release/'
+          scoped='https://scoped.example.org/repo/'
+          manifest='https://from-manifest.example.org/'
+          errors=0
+
+          # $1 label, $2 expected registry, $3 expected source,
+          # $4 expected scope ('' for an unscoped package)
+          run_case() {
+            local label="$1" want="$2" want_source="$3" want_scope="${4:-}"
+            local out="${RUNNER_TEMP}/case-out.txt"
+            : > "${out}"
+            set +e
+            log="$(PROJECT_DIR="${RUNNER_TEMP}/proj" REGISTRY_URL="${input}" \
+              TARBALL="${TARBALL:-}" \
+              GITHUB_OUTPUT="${out}" node "${resolver}" 2>&1)"
+            rc=$?
+            set -e
+            if [ "${want}" = 'reject' ]; then
+              if [ "${rc}" = "0" ]; then
+                echo "${label}: expected rejection, resolver succeeded ❌"
+                errors=1
+              elif ! printf '%s' "${log}" | grep -q '^::error::'; then
+                echo "${label}: rejected without a labelled error ❌"
+                errors=1
+              fi
+              return
+            fi
+            if [ "${rc}" != "0" ]; then
+              echo "${label}: resolver failed ❌"
+              printf '%s\n' "${log}" | tail -2
+              errors=1
+              return
+            fi
+            # Outputs use the heredoc form, so the value is the line
+            # after its key rather than a key=value pair.
+            got="$(grep -A1 '^registry<<' "${out}" | tail -1)"
+            got_source="$(grep -A1 '^registry_source<<' "${out}" | tail -1)"
+            if [ "${got}" != "${want}" ]; then
+              echo "${label}: resolved '${got}', expected '${want}' ❌"
+              errors=1
+            fi
+            if [ "${got_source}" != "${want_source}" ]; then
+              echo "${label}: source '${got_source}'," \
+                "expected '${want_source}' ❌"
+              errors=1
+            fi
+            # Every consulted scope is pinned by the publish and the
+            # verification, so a missing one silently lets a project
+            # key redirect npm view. Stated per case rather than
+            # inferred from the label: 'unscoped' contains 'scoped'.
+            # Every line between the heredoc delimiters, joined with a
+            # space for comparison. A single-line read would see only
+            # the first scope and miss a dropped second one -- exactly
+            # the regression this exists to catch.
+            got_scope="$(awk '/^registry_scopes<</{f=1;next}
+              f&&/^ghadelimiter_/{f=0} f' \
+              "${out}" | paste -sd' ' -)"
+            if [ "${got_scope}" != "${want_scope}" ]; then
+              echo "${label}: scopes '${got_scope}'," \
+                "expected '${want_scope}' ❌"
+              errors=1
+            fi
+          }
+
+          mkdir -p "${RUNNER_TEMP}/proj"
+          write_manifest() {
+            printf '%s' "$1" > "${RUNNER_TEMP}/proj/package.json"
+          }
+
+          # Unscoped package, nothing set: the input stands.
+          rm -f "${RUNNER_TEMP}/proj/.npmrc"
+          write_manifest '{"name":"plain","version":"1.0.0"}'
+          run_case 'unscoped default' "${input}" input ''
+
+          # Scoped package with a real .npmrc. This is the case the unit
+          # tests cannot reach: the value comes back through npm's own
+          # configuration resolution, not a literal supplied by a test.
+          printf '@onap:registry=%s\n' "${scoped}" \
+            > "${RUNNER_TEMP}/proj/.npmrc"
+          write_manifest '{"name":"@onap/ui-common","version":"1.0.0"}'
+          run_case 'npmrc scoped' "${scoped}" npm-config-scoped '@onap'
+
+          # publishConfig outranks the .npmrc entry, because npm
+          # flattens it over the resolved options.
+          write_manifest '{"name":"@onap/ui-common","version":"1.0.0",
+            "publishConfig":{"@onap:registry":"'"${manifest}"'"}}'
+          run_case 'publishConfig wins' "${manifest}" \
+            publishConfig-scoped '@onap'
+
+          # A scoped entry must not redirect an unscoped package.
+          write_manifest '{"name":"plain","version":"1.0.0"}'
+          run_case 'scoped ignored when unscoped' "${input}" input ''
+
+          # An override arrives from the project's own files, so it gets
+          # the scheme check registry_url received in the validate step.
+          rm -f "${RUNNER_TEMP}/proj/.npmrc"
+          write_manifest '{"name":"@onap/ui-common","version":"1.0.0",
+            "publishConfig":{"@onap:registry":"http://evil.example/"}}'
+          run_case 'http override refused' reject reject
+
+          # pickRegistry consults npm's configured 'scope' after the
+          # package's own, so an unscoped package is redirected too.
+          # This needs real npm config, which the unit tests cannot
+          # supply.
+          printf 'scope=@onap\n@onap:registry=%s\n' "${scoped}" \
+            > "${RUNNER_TEMP}/proj/.npmrc"
+          write_manifest '{"name":"plain","version":"1.0.0"}'
+          run_case 'configured scope fallback' "${scoped}" \
+            npm-config-scoped '@onap'
+
+          # Two consulted scopes at once: the package's own, and a
+          # different configured one. Both must come back, because the
+          # publish and verification pin every line of this output --
+          # a dropped second scope re-enables a registry npm consults.
+          # Only a real bundle run over real npm config can show the
+          # multi-line output survives end to end.
+          printf 'scope=@other\n@other:registry=%s\n' "${scoped}" \
+            > "${RUNNER_TEMP}/proj/.npmrc"
+          write_manifest '{"name":"@onap/ui-common","version":"1.0.0"}'
+          run_case 'two consulted scopes' "${scoped}" \
+            npm-config-scoped '@onap @other'
+
+          # publishConfig.scope flattens into opts.scope, so it redirects
+          # an unscoped package and outranks the configured scope.
+          rm -f "${RUNNER_TEMP}/proj/.npmrc"
+          write_manifest '{"name":"plain","version":"1.0.0",
+            "publishConfig":{"scope":"@other",
+              "@other:registry":"'"${scoped}"'"}}'
+          run_case 'publishConfig.scope redirects' "${scoped}" \
+            publishConfig-scoped '@other'
+
+          # A present but empty publishConfig key masks the .npmrc
+          # value: npm flattens it over the resolved options, so the
+          # selection moves past it rather than falling back.
+          printf '@onap:registry=%s\n' "${scoped}" \
+            > "${RUNNER_TEMP}/proj/.npmrc"
+          write_manifest '{"name":"@onap/ui-common","version":"1.0.0",
+            "publishConfig":{"@onap:registry":""}}'
+          run_case 'empty publishConfig key masks npmrc' "${input}" \
+            input '@onap'
+
+          # A tarball publish resolves from the manifest inside the
+          # archive, because that is the one npm reads. Reading the
+          # working directory here would resolve the registry from a
+          # manifest nothing publishes -- and a caller packing
+          # elsewhere would never notice.
+          rm -f "${RUNNER_TEMP}/proj/.npmrc"
+          write_manifest '{"name":"decoy","version":"0.0.1"}'
+          mkdir -p "${RUNNER_TEMP}/archive"
+          cat > "${RUNNER_TEMP}/archive/package.json" <<'JSON'
+          {"name":"@onap/from-tarball","version":"9.9.9",
+           "publishConfig":
+             {"@onap:registry":"https://from-tarball.example.org/"}}
+          JSON
+          ( cd "${RUNNER_TEMP}/archive" \
+            && npm pack --pack-destination "${RUNNER_TEMP}" \
+              >/dev/null 2>&1 )
+          export TARBALL="${RUNNER_TEMP}/onap-from-tarball-9.9.9.tgz"
+          run_case 'tarball manifest wins' \
+            'https://from-tarball.example.org/' publishConfig-scoped '@onap'
+          unset TARBALL
+
+          if [ "${errors}" != "0" ]; then
+            echo "Scoped registry resolution failed ❌" \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "Scoped registry resolution correct ✅"
+          echo "Scoped registry resolution correct ✅" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      # Running the bundle proves the rules; it says nothing about the
+      # action consuming them. Reverting either REGISTRY_URL assignment
+      # would restore the original false-reporting defect with every
+      # check above still green, so the wiring is asserted directly.
+      - name: "Assert the action consumes the resolved registry"
+        shell: bash
+        run: |
+          # Assert the action consumes the resolved registry
+          python3 - <<'PY'
+          import sys
+
+          import yaml
+
+          with open('action.yaml') as handle:
+              steps = yaml.safe_load(handle)['runs']['steps']
+
+          by_id = {s.get('id'): s for s in steps if s.get('id')}
+          resolved = '${' + '{ steps.registry.outputs.registry }' + '}'
+          errors = []
+
+          if 'registry' not in by_id:
+              errors.append("no step with id 'registry' in action.yaml")
+
+          # The publish and verify steps must read the resolved value.
+          # The resolve step itself must keep reading the raw input,
+          # since it is the thing being resolved -- pointing it at its
+          # own output would be a silent no-op.
+          resolved_scopes = (
+              '${' + '{ steps.registry.outputs.registry_scopes }' + '}'
+          )
+          expectations = {
+              'registry': ('${' + '{ inputs.registry_url }' + '}',
+                           'the caller input it resolves'),
+              'publish': (resolved, 'the resolved registry'),
+          }
+          # The scope-pin loop is a no-op without this, and the dry-run
+          # fixture would still pass because its manifest already selects
+          # the resolved registry. The verify step is checked further
+          # down; the publish step needs the same assertion.
+          scopes_env = str(
+              (by_id.get('publish', {}).get('env') or {})
+              .get('REGISTRY_SCOPES', '')
+          ).strip()
+          if scopes_env != resolved_scopes:
+              errors.append(
+                  f"step 'publish' REGISTRY_SCOPES is {scopes_env!r}, "
+                  f'expected {resolved_scopes!r}; the pin loop would '
+                  'iterate nothing'
+              )
+          for step_id, (want, description) in expectations.items():
+              step = by_id.get(step_id)
+              if step is None:
+                  errors.append(f"no step with id '{step_id}'")
+                  continue
+              got = str((step.get('env') or {}).get('REGISTRY_URL', '')).strip()
+              if got != want:
+                  errors.append(
+                      f"step '{step_id}' REGISTRY_URL is {got!r}, expected "
+                      f'{want!r} ({description})'
+                  )
+
+          # The verify step carries no id, so it is found by name.
+          verify = [
+              s for s in steps
+              if 'Verify publication' in str(s.get('name', ''))
+          ]
+          if len(verify) != 1:
+              errors.append(
+                  f'found {len(verify)} verify steps, expected one'
+              )
+          else:
+              got = str(
+                  (verify[0].get('env') or {}).get('REGISTRY_URL', '')
+              ).strip()
+              if got != resolved:
+                  errors.append(
+                      f'the verify step REGISTRY_URL is {got!r}, expected '
+                      f'{resolved!r} -- it would check a registry the '
+                      'package may never have reached'
+                  )
+              # --registry does not outrank a scoped setting, so the
+              # step must also put the resolved registry under the
+              # scoped key. Without it npm view yields to the project's
+              # @scope:registry and checks the wrong host, which the
+              # REGISTRY_URL assertion above cannot see.
+              body = str(verify[0].get('run', ''))
+              if 'done <<< "${REGISTRY_SCOPES}"' not in body:
+                  errors.append(
+                      'the verify step does not force the resolved '
+                      'registry under every consulted scope; npm view '
+                      'would prefer a project @scope:registry'
+                  )
+              scope_env = str(
+                  (verify[0].get('env') or {}).get('REGISTRY_SCOPES', '')
+              ).strip()
+              want_scope = (
+                  '${' + '{ steps.registry.outputs.registry_scopes }' + '}'
+              )
+              if scope_env != want_scope:
+                  errors.append(
+                      f'the verify step REGISTRY_SCOPES is {scope_env!r}, '
+                      f'expected {want_scope!r}'
+                  )
+
+          # A dry run still queries the registry, so --registry must not
+          # be confined to the real-publish branch: omitting it sends the
+          # lookup to npm's default while the summary names the resolved
+          # one. Easy to reintroduce, invisible in every other check.
+          publish_body = str(by_id.get('publish', {}).get('run', ''))
+          if 'set -- "$@" --registry "${REGISTRY_URL}"' not in publish_body:
+              errors.append(
+                  'the publish step does not pass --registry from the '
+                  'resolved value'
+              )
+          dry_branch = publish_body.split('if [ "${DRY_RUN}" = "true" ]')
+          if len(dry_branch) > 1 and '--registry' in dry_branch[1]:
+              errors.append(
+                  'the publish step sets --registry inside the dry-run '
+                  'branch; a dry run would query npm default registry'
+              )
+
+          # Pinning the scoped key at publish time is what makes the
+          # resolved registry authoritative. Without it a prepublishOnly
+          # script can add publishConfig["@scope:registry"] and redirect
+          # the publish after resolution, leaving the summary and the
+          # verification on a registry nothing used -- and the publish
+          # still succeeds, so nothing else here would notice.
+          if 'done <<< "${REGISTRY_SCOPES}"' not in publish_body:
+              errors.append(
+                  'the publish step does not pin the resolved registry '
+                  'under the scoped key; a prepublishOnly script could '
+                  'redirect the publish after resolution'
+              )
+
+          # The resolve step now runs the first bundled program, so it
+          # carries the runtime guard. Without it an old node_version
+          # produces a raw module error instead of naming the input to
+          # raise -- and no other check here would notice, because the
+          # runners CI uses are new enough to load the bundle.
+          registry_body = str(by_id.get('registry', {}).get('run', ''))
+          if '--selftest' not in registry_body:
+              errors.append(
+                  'the resolve step does not self-test the bundle before '
+                  'using it; an unsupported node_version would fail with '
+                  'a raw module error'
+              )
+
+          # Validation stages the archive outside the workspace, and
+          # every step that opens it must use that copy. Reverting one
+          # to the workspace path reopens the substitution window, and
+          # nothing else here would notice: the publish still succeeds.
+          for step_id in ('registry', 'publish'):
+              body = str(by_id.get(step_id, {}).get('run', ''))
+              if '"${RUNNER_TEMP:?}"/*' not in body:
+                  errors.append(
+                      f"step '{step_id}' does not require the staged "
+                      'tarball; it would reopen the mutable workspace path'
+                  )
+
+          # Resolution must precede the .npmrc step, which replaces the
+          # project's own file. Resolving afterwards would read this
+          # action's credential file instead of the project's config,
+          # and the credential would be keyed to the wrong registry --
+          # a 401 that no test here would otherwise catch.
+          names = [str(s.get('name', '')) for s in steps]
+          try:
+              resolve_at = names.index('Resolve the effective registry')
+              npmrc_at = names.index('Create authenticated .npmrc')
+          except ValueError:
+              errors.append('cannot find the resolve and .npmrc steps')
+          else:
+              if resolve_at > npmrc_at:
+                  errors.append(
+                      'the .npmrc step runs before the registry is '
+                      'resolved; it replaces the project .npmrc, so '
+                      'resolution would read the generated file'
+                  )
+          npmrc = [
+              s for s in steps
+              if 'npmrc' in str(s.get('name', '')).lower()
+          ]
+          if len(npmrc) == 1:
+              keyed = str(
+                  (npmrc[0].get('with') or {}).get('registry_url', '')
+              ).strip()
+              if keyed != resolved:
+                  errors.append(
+                      'the .npmrc step keys its credential to '
+                      f'{keyed!r}, expected {resolved!r}; a publish '
+                      'redirected by the project would reach a '
+                      'registry with no credential'
+                  )
+
+
+          if errors:
+              for message in errors:
+                  print(f'::error::{message}')
+              sys.exit('Registry wiring incorrect \u274c')
+
+          print('Registry wiring correct \u2705')
+          PY
+          echo "Registry wiring correct \u2705" >> "$GITHUB_STEP_SUMMARY"
+
+      # And the resolve step must actually run inside the action, which
+      # only invoking the action can show. A dry run reaches it without
+      # credentials or a registry.
+      #
+      # The override names registry.npmjs.org rather than an example
+      # host: egress is blocked to the allow-list, and a dry run still
+      # queries the selected registry for existing metadata, so an
+      # unreachable one fails on DNS before the assertion is reached.
+      # It still differs from registry_url, which is what the case
+      # needs.
+      - name: "Build a scoped fixture"
+        shell: bash
+        run: |
+          # Build a scoped fixture
+          mkdir -p scoped-fixture
+          cat > scoped-fixture/package.json <<'JSON'
+          {
+            "name": "@onap/scoped-fixture",
+            "version": "0.0.0",
+            "license": "Apache-2.0",
+            "publishConfig": {
+              "@onap:registry": "https://registry.npmjs.org/"
+            }
+          }
+          JSON
+
+      - name: "Running local action: scoped override, dry run"
+        id: scoped
+        uses: ./
+        with:
+          path_prefix: scoped-fixture
+          publish_version: '1.0.0'
+          node_version: '22'
+          dry_run: 'true'
+          registry_url: 'https://nexus3.example.org/repository/npm.release/'
+
+      - name: "Assert the action reported the override"
+        shell: bash
+        env:
+          PACKAGE_NAME: ${{ steps.scoped.outputs.package_name }}
+        run: |
+          # Assert the action reported the override
+          if [ "${PACKAGE_NAME}" != "@onap/scoped-fixture" ]; then
+            echo "Published '${PACKAGE_NAME}', expected the fixture ❌"
+            exit 1
+          fi
+          echo "Action ran the resolver against a scoped package ✅"
+          echo "Action ran the resolver against a scoped package ✅" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      # The check above is a smoke test. A resolver replaced by a no-op
+      # leaves REGISTRY_URL empty, npm falls back to its own default,
+      # and the fixture still packs -- so the assertion passes for the
+      # wrong reason. This one cannot be satisfied without the resolver
+      # running inside the action and reaching a verdict, because the
+      # action must *fail*.
+      - name: "Build a fixture with an unusable override"
+        shell: bash
+        run: |
+          # Build a fixture with an unusable override
+          mkdir -p refused-fixture
+          cat > refused-fixture/package.json <<'JSON'
+          {
+            "name": "@onap/refused-fixture",
+            "version": "0.0.0",
+            "license": "Apache-2.0",
+            "publishConfig": {
+              "@onap:registry": "http://cleartext.example.org/"
+            }
+          }
+          JSON
+
+      - name: "Running local action: http override must fail"
+        id: refused
+        continue-on-error: true
+        uses: ./
+        with:
+          path_prefix: refused-fixture
+          publish_version: '1.0.0'
+          node_version: '22'
+          dry_run: 'true'
+          registry_url: 'https://nexus3.example.org/repository/npm.release/'
+
+      - name: "Assert the action refused the http override"
+        shell: bash
+        env:
+          OUTCOME: ${{ steps.refused.outcome }}
+        run: |
+          # Assert the action refused the http override
+          if [ "${OUTCOME}" != "failure" ]; then
+            echo "The action succeeded with an http registry override ❌"
+            echo "Outcome was '${OUTCOME}'; the resolver either did not"
+            echo "run inside the action or did not reject the override"
+            exit 1
+          fi
+          echo "Action refused a cleartext registry override ✅"
+          echo "Action refused a cleartext registry override ✅" \
+            >> "$GITHUB_STEP_SUMMARY"
