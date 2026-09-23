@@ -18,66 +18,22 @@
  * Writes: the 'registry', 'registry_source' and 'registry_scopes' outputs.
  */
 
-import { spawnSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
-import path from 'node:path';
-
 import { error, info, notice, setOutput } from '../actions-io.js';
 import {
   loadNpmInternals,
+  manifestFields,
   NpmInternalsError,
   type LoadedConfig,
+  type Manifest,
   type PickRegistry,
 } from '../npm-internals.js';
 import { publishFlags } from '../publish-options.js';
 import {
+  assertSupportedNpm,
   RegistryError,
   resolveEffectiveRegistry,
   type RegistryResolution,
 } from '../registry.js';
-
-/**
- * The manifest npm will resolve the publish from.
- *
- * For a tarball publish that is the manifest *inside the archive*, not the
- * one in the working directory. npm reads the spec from the tarball, so its
- * scope and its publishConfig decide the registry -- verified: a tarball
- * whose publishConfig named one host published there while the working
- * directory held an unscoped project and --registry named a third.
- *
- * Reading the project directory in that mode would resolve the registry
- * from a manifest nothing publishes.
- */
-function readManifest(projectDir: string, tarball: string): { name?: unknown; publishConfig?: unknown } {
-  if (tarball !== '') {
-    const result = spawnSync('tar', ['-xzOf', tarball, 'package/package.json'], {
-      encoding: 'utf8',
-      maxBuffer: 16 * 1024 * 1024,
-    });
-    if (result.error || result.status !== 0) {
-      throw new Error(`cannot read package.json from ${tarball}`);
-    }
-    return JSON.parse(result.stdout) as { name?: unknown; publishConfig?: unknown };
-  }
-  return JSON.parse(readFileSync(path.join(projectDir, 'package.json'), 'utf8')) as {
-    name?: unknown;
-    publishConfig?: unknown;
-  };
-}
-
-/** The manifest fields the selection needs, in the shapes it expects. */
-function manifestFields(manifest: { name?: unknown; publishConfig?: unknown }): {
-  packageName: string;
-  publishConfig: Record<string, unknown> | undefined;
-} {
-  return {
-    packageName: typeof manifest.name === 'string' ? manifest.name : '',
-    publishConfig:
-      manifest.publishConfig && typeof manifest.publishConfig === 'object'
-        ? (manifest.publishConfig as Record<string, unknown>)
-        : undefined,
-  };
-}
 
 /** Write the outputs and say what was decided. */
 function emit(resolution: RegistryResolution, registryUrl: string): void {
@@ -117,31 +73,17 @@ async function main(): Promise<void> {
   const projectDir = process.env.PROJECT_DIR ?? '';
   const registryUrl = process.env.REGISTRY_URL ?? '';
   const tarball = (process.env.TARBALL ?? '').trim();
-
-  let manifest: { name?: unknown; publishConfig?: unknown };
-  try {
-    manifest = readManifest(projectDir, tarball);
-  } catch (cause) {
-    error(
-      tarball !== ''
-        ? `Cannot read the manifest from ${tarball}: ${String(cause)}`
-        : `Cannot read package.json in ${projectDir}: ${String(cause)}`,
-    );
-    process.exit(1);
-  }
-
-  const { packageName, publishConfig } = manifestFields(manifest);
   const cwd = projectDir || '.';
 
   // The npm on PATH is the one the publish step runs, so its own code
   // decides. Found from the executable, not from 'npm root -g', whose
   // answer is itself configuration.
   const internals = loadNpmInternals();
+  // Checked before loading configuration, so an old npm fails for what it
+  // is rather than for a missing module.
+  assertSupportedNpm(internals.npmVersion);
   if (!internals.loadConfig) {
-    error(
-      `npm ${internals.npmVersion} predates @npmcli/config, which this ` +
-        'action loads to resolve the publish registry. Use npm 7 or later.',
-    );
+    error(`npm ${internals.npmVersion} did not provide @npmcli/config.`);
     process.exit(1);
   }
   // Configured exactly as the publish step invokes npm: the same project
@@ -152,6 +94,27 @@ async function main(): Promise<void> {
     env: process.env,
   });
   info(`Resolving the registry with npm ${internals.npmVersion}'s own configuration`);
+
+  // The manifest npm will publish, read by npm's own reader, so the name
+  // is normalised as npm normalises it. For a tarball publish that is the
+  // manifest *inside the archive*, not the working directory's: its scope
+  // and publishConfig decide the registry.
+  let manifest: Manifest;
+  try {
+    manifest = await internals.readManifest(
+      tarball !== '' ? { tarball } : { dir: cwd },
+      config.flat,
+    );
+  } catch (cause) {
+    const reason = cause instanceof Error ? cause.message.split('\n')[0] : String(cause);
+    error(
+      tarball !== ''
+        ? `Cannot read the manifest from ${tarball}: ${reason}`
+        : `Cannot read package.json in ${projectDir}: ${reason}`,
+    );
+    process.exit(1);
+  }
+  const { packageName, publishConfig } = manifestFields(manifest);
 
   let resolution;
   try {

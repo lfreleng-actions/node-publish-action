@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 The Linux Foundation
 
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -32,26 +32,59 @@ function write(file: string, content: string): void {
 interface FakeNpm {
   /** Include npm-registry-fetch; default true. */
   registryFetch?: boolean;
-  /** Include @npmcli/config; default false. */
+  /** Include @npmcli/config; default true, as every npm from 7 does. */
   config?: boolean;
   /** Where definitions live, if config is included. */
   definitions?: 'config' | 'npm' | 'none' | 'malformed';
+  /** npm's version; default 99.1.2. */
+  version?: string;
+  /** Prefix directory name under the test root; default 'prefix'. */
+  prefixName?: string;
+  /** How the installation is laid out; default 'posix'. */
+  layout?: 'posix' | 'windows';
 }
 
 /**
- * Lay out an npm the way setup-node does: <prefix>/bin/npm linking to
- * <prefix>/lib/node_modules/npm/bin/npm-cli.js. Returns the prefix.
+ * Lay out an npm the way setup-node does. On POSIX: <prefix>/bin/npm
+ * linking to <prefix>/lib/node_modules/npm/bin/npm-cli.js. On Windows,
+ * Node's own layout: a copied launcher and node.exe in <prefix>, beside
+ * <prefix>/node_modules/npm. Returns the prefix and the directory that
+ * goes on PATH.
  */
-function fakeNpm(options: FakeNpm = {}): { prefix: string; npmDir: string } {
-  const { registryFetch = true, config = false, definitions = 'config' } = options;
-  const prefix = path.join(root, 'prefix');
-  const npmDir = path.join(prefix, 'lib', 'node_modules', 'npm');
-  write(path.join(npmDir, 'package.json'), JSON.stringify({ name: 'npm', version: '99.1.2' }));
+function fakeNpm(options: FakeNpm = {}): { prefix: string; npmDir: string; bin: string } {
+  const {
+    registryFetch = true,
+    config = true,
+    definitions = 'config',
+    version = '99.1.2',
+    prefixName = 'prefix',
+    layout = 'posix',
+  } = options;
+  const prefix = path.join(root, prefixName);
+  const bin = layout === 'posix' ? path.join(prefix, 'bin') : prefix;
+  const npmDir = path.join(prefix, ...(layout === 'posix' ? ['lib'] : []), 'node_modules', 'npm');
+  // Declares its bundled modules as dependencies, as a real npm manifest
+  // does; the closure check walks exactly these.
+  write(
+    path.join(npmDir, 'package.json'),
+    JSON.stringify({
+      name: 'npm',
+      version,
+      dependencies: { 'npm-registry-fetch': '*', '@npmcli/config': '*' },
+    }),
+  );
   const cli = path.join(npmDir, 'bin', 'npm-cli.js');
   write(cli, '#!/usr/bin/env node\n');
   chmodSync(cli, 0o755);
-  mkdirSync(path.join(prefix, 'bin'), { recursive: true });
-  symlinkSync(cli, path.join(prefix, 'bin', 'npm'));
+  if (layout === 'posix') {
+    mkdirSync(bin, { recursive: true });
+    symlinkSync(cli, path.join(bin, 'npm'));
+  } else {
+    for (const file of ['npm', 'node.exe']) {
+      write(path.join(bin, file), '#!/bin/sh\n');
+      chmodSync(path.join(bin, file), 0o755);
+    }
+  }
 
   const nm = path.join(npmDir, 'node_modules');
   if (registryFetch) {
@@ -72,7 +105,10 @@ function fakeNpm(options: FakeNpm = {}): { prefix: string; npmDir: string } {
       [
         'module.exports = class Config {',
         '  constructor (o) { this.o = o; }',
-        '  async load () {}',
+        '  async load () {',
+        '    this.globalPrefix = this.o.env.npm_config_prefix ??',
+        "      require('path').resolve(this.o.npmPath, '..', '..');",
+        '  }',
         '  get (k) { return k === "argv" ? this.o.argv : this.o.env[k]; }',
         '  find (k) { return k in this.o.env ? "env" : null; }',
         '  get flat () { return { cwd: this.o.cwd }; }',
@@ -85,7 +121,14 @@ function fakeNpm(options: FakeNpm = {}): { prefix: string; npmDir: string } {
       write(path.join(npmDir, 'lib', 'utils', 'config', 'index.js'), defsBody);
     }
   }
-  return { prefix, npmDir };
+  return { prefix, npmDir, bin };
+}
+
+/** Rewrite npm's npm-registry-fetch to declare `fields` and run `body` as it loads. */
+function rewriteFetch(npmDir: string, fields: object, body = ''): void {
+  const fetchDir = path.join(npmDir, 'node_modules', 'npm-registry-fetch');
+  write(path.join(fetchDir, 'package.json'), JSON.stringify({ main: 'index.js', ...fields }));
+  write(path.join(fetchDir, 'index.js'), `${body} module.exports = { pickRegistry: () => 'x' };`);
 }
 
 describe('locateNpm', () => {
@@ -95,18 +138,39 @@ describe('locateNpm', () => {
   });
 
   it('uses the first npm on PATH, not a later one', () => {
-    const { prefix, npmDir } = fakeNpm();
-    const later = path.join(root, 'later');
-    mkdirSync(later);
-    expect(locateNpm([path.join(prefix, 'bin'), later].join(path.delimiter))).toBe(npmDir);
+    // Two distinct installations, so an implementation that searched
+    // PATH in any other order would pick the wrong one.
+    const first = fakeNpm({ prefixName: 'first', version: '11.0.0' });
+    const second = fakeNpm({ prefixName: 'second', version: '10.0.0' });
+    const bins = [path.join(first.prefix, 'bin'), path.join(second.prefix, 'bin')];
+    expect(locateNpm(bins.join(path.delimiter))).toBe(first.npmDir);
+    expect(locateNpm([...bins].reverse().join(path.delimiter))).toBe(second.npmDir);
   });
 
-  it('skips PATH entries with no npm and empty entries', () => {
+  it('skips PATH entries with no npm', () => {
     const { prefix, npmDir } = fakeNpm();
     const empty = path.join(root, 'empty');
     mkdirSync(empty);
-    const pathEnv = ['', empty, path.join(prefix, 'bin')].join(path.delimiter);
-    expect(locateNpm(pathEnv)).toBe(npmDir);
+    expect(locateNpm([empty, path.join(prefix, 'bin')].join(path.delimiter))).toBe(npmDir);
+  });
+
+  it.each([
+    ['an empty entry', ''],
+    ['a dot', '.'],
+    ['a relative directory', 'bin'],
+  ])('refuses %s ahead of any npm, which names a directory-dependent npm', (_label, entry) => {
+    // POSIX resolves these against the working directory, and this
+    // action's steps run from different ones: the loader and the publish
+    // step could each find a different npm.
+    const { prefix } = fakeNpm();
+    expect(() => locateNpm([entry, path.join(prefix, 'bin')].join(path.delimiter))).toThrow(
+      /relative entry/,
+    );
+  });
+
+  it('accepts a relative entry after the npm, which never takes part', () => {
+    const { prefix, npmDir } = fakeNpm();
+    expect(locateNpm([path.join(prefix, 'bin'), '', '.'].join(path.delimiter))).toBe(npmDir);
   });
 
   it('ignores a non-executable file named npm', () => {
@@ -116,6 +180,21 @@ describe('locateNpm', () => {
     chmodSync(path.join(decoy, 'npm'), 0o644);
     expect(locateNpm([decoy, path.join(prefix, 'bin')].join(path.delimiter))).toBe(npmDir);
   });
+
+  // Root may execute any file with an execute bit set anywhere, so the case
+  // cannot be told apart when running as root.
+  it.skipIf(process.getuid?.() === 0)(
+    'judges executability for this process, not by any execute bit',
+    () => {
+      // Group-executable but not owner-executable: any-bit says yes, but
+      // the shell running as the owner could not execute it.
+      const { prefix, npmDir } = fakeNpm();
+      const decoy = path.join(root, 'group-only');
+      write(path.join(decoy, 'npm'), '#!/bin/sh\n');
+      chmodSync(path.join(decoy, 'npm'), 0o610);
+      expect(locateNpm([decoy, path.join(prefix, 'bin')].join(path.delimiter))).toBe(npmDir);
+    },
+  );
 
   it('refuses an npm on PATH that is not an npm package, rather than trying the next', () => {
     const { prefix } = fakeNpm();
@@ -131,7 +210,19 @@ describe('locateNpm', () => {
     expect(() => locateNpm(root)).toThrow(/No 'npm' executable found on PATH/);
     // An empty PATH, as an unset one reaches the loader. (An explicit
     // `undefined` would select the default parameter, the real PATH.)
-    expect(() => locateNpm('')).toThrow(NpmInternalsError);
+    expect(() => locateNpm('')).toThrow(/PATH is empty/);
+  });
+
+  it("finds the npm beside node.exe in Node's Windows layout, where nothing links", () => {
+    const { bin, npmDir } = fakeNpm({ layout: 'windows' });
+    expect(locateNpm(bin)).toBe(npmDir);
+  });
+
+  it('refuses a Windows launcher with no node.exe beside it', () => {
+    // It would run whichever node PATH finds, and that node's npm.
+    const { bin } = fakeNpm({ layout: 'windows' });
+    rmSync(path.join(bin, 'node.exe'));
+    expect(() => locateNpm(bin)).toThrow(/does not resolve to an npm package/);
   });
 });
 
@@ -156,8 +247,105 @@ describe('loadNpmInternals', () => {
   });
 
   it('reports no config loader on an npm without @npmcli/config (npm 6)', () => {
-    const { npmDir } = fakeNpm({ config: false });
+    const { npmDir } = fakeNpm({ config: false, version: '6.14.18' });
     expect(loadNpmInternals(npmDir).loadConfig).toBeUndefined();
+  });
+
+  it('refuses a missing @npmcli/config on npm 7 or later, as a broken install', () => {
+    // Only npm 6 lacks it by design. Anywhere else, treating absence as a
+    // capability gap would quietly skip the checks that need it.
+    const { npmDir } = fakeNpm({ config: false, version: '11.0.0' });
+    expect(() => loadNpmInternals(npmDir)).toThrow(/@npmcli\/config is missing/);
+  });
+
+  it("refuses a module that resolves outside npm's own tree", () => {
+    // createRequire walks up into parent node_modules. With npm's bundled
+    // copy gone, a sibling installed beside npm would otherwise load.
+    const { npmDir } = fakeNpm({ registryFetch: false });
+    const sibling = path.join(path.dirname(npmDir), 'npm-registry-fetch');
+    write(path.join(sibling, 'package.json'), '{"main":"index.js"}');
+    write(path.join(sibling, 'index.js'), 'module.exports = { pickRegistry: () => "imposter" };');
+    expect(() => loadNpmInternals(npmDir)).toThrow(/resolves outside npm's own tree/);
+  });
+
+  it.each([
+    ['a sibling package', 'evil-dep/index.js', true],
+    ['a file module', 'evil-dep.js', false],
+    ['a directory with no manifest', 'evil-dep/index.js', false],
+  ])("refuses a transitive dependency that resolves outside npm's tree to %s", (_label, entry, manifest) => {
+    // The entry point is in npm's tree, but it requires a dependency that
+    // is missing there, so an ordinary require would walk up and run
+    // whatever Node finds beside npm -- not only a package directory. It
+    // must never execute.
+    const { npmDir } = fakeNpm();
+    rewriteFetch(npmDir, { dependencies: { 'evil-dep': '1.0.0' } }, "require('evil-dep');");
+    const marker = path.join(root, 'EXECUTED');
+    const beside = path.dirname(npmDir);
+    if (manifest) write(path.join(beside, 'evil-dep', 'package.json'), '{"main":"index.js"}');
+    write(
+      path.join(beside, entry),
+      `require('fs').writeFileSync(${JSON.stringify(marker)}, 'ran');`,
+    );
+
+    expect(() => loadNpmInternals(npmDir)).toThrow(
+      /dependency 'evil-dep' resolves outside npm's own tree/,
+    );
+    expect(existsSync(marker)).toBe(false);
+  });
+
+  const optionalPeer = {
+    peerDependencies: { 'evil-dep': '*' },
+    peerDependenciesMeta: { 'evil-dep': { optional: true } },
+  };
+  const { peerDependenciesMeta } = optionalPeer;
+
+  it.each([
+    ['an optional peer', optionalPeer],
+    // As debug names supports-color, which it requires as it loads.
+    ['a peer named only in peerDependenciesMeta', { peerDependenciesMeta }],
+    ['an optional dependency', { optionalDependencies: { 'evil-dep': '*' } }],
+  ])("refuses %s that resolves outside npm's tree", (_label, declared) => {
+    // npm may leave these uninstalled, but a require of one resolves like
+    // any other: up and out of npm's tree to whatever sits beside npm.
+    const { npmDir } = fakeNpm();
+    rewriteFetch(npmDir, declared, "require('evil-dep');");
+    const marker = path.join(root, 'EXECUTED');
+    const sibling = path.join(path.dirname(npmDir), 'evil-dep');
+    write(path.join(sibling, 'package.json'), '{"main":"index.js"}');
+    write(
+      path.join(sibling, 'index.js'),
+      `require('fs').writeFileSync(${JSON.stringify(marker)}, 'ran');`,
+    );
+
+    expect(() => loadNpmInternals(npmDir)).toThrow(
+      /dependency 'evil-dep' resolves outside npm's own tree/,
+    );
+    expect(existsSync(marker)).toBe(false);
+  });
+
+  it('leaves an optional peer alone when nothing provides it', () => {
+    const { npmDir } = fakeNpm();
+    rewriteFetch(npmDir, optionalPeer);
+    expect(loadNpmInternals(npmDir).pickRegistry('p', {})).toBe('x');
+  });
+
+  it('reports a module that is present but fails to load, rather than calling it absent', () => {
+    // A missing *transitive* import raises MODULE_NOT_FOUND too. It must
+    // not read as "this location does not exist" and fall through.
+    const { npmDir } = fakeNpm({ config: true, version: '11.0.0' });
+    write(
+      path.join(npmDir, 'node_modules', '@npmcli', 'config', 'lib', 'definitions', 'index.js'),
+      "require('./no-such-dependency'); module.exports = {};",
+    );
+    // The npm 7-8 location exists too; a fall-through would load it.
+    write(
+      path.join(npmDir, 'lib', 'utils', 'config', 'index.js'),
+      'module.exports = { definitions: {}, shorthands: {}, flatten: () => ({}) };',
+    );
+    const { loadConfig } = loadNpmInternals(npmDir);
+    return expect(loadConfig?.({ cwd: root, flags: [], env: {} })).rejects.toThrow(
+      /present but fails to load/,
+    );
   });
 
   it.each([
@@ -208,5 +396,33 @@ describe('loadNpmInternals', () => {
       '@npmcli/config/lib/definitions',
       './lib/utils/config/index.js',
     ]);
+  });
+
+  it.each([
+    ['its default prefix, its own directory', undefined],
+    ['a configured prefix holding no npm', 'empty'],
+  ])('loads config in the Windows layout under %s', async (_label, prefixName) => {
+    const { npmDir } = fakeNpm({ layout: 'windows' });
+    const env = prefixName === undefined ? {} : { npm_config_prefix: path.join(root, prefixName) };
+    const { loadConfig } = loadNpmInternals(npmDir);
+    await expect(loadConfig?.({ cwd: root, flags: [], env })).resolves.toBeDefined();
+  });
+
+  it('refuses the Windows layout when the configured prefix holds an npm the launcher runs instead', async () => {
+    const { npmDir } = fakeNpm({ layout: 'windows' });
+    const other = fakeNpm({ layout: 'windows', prefixName: 'other' });
+    const { loadConfig } = loadNpmInternals(npmDir);
+    await expect(
+      loadConfig?.({ cwd: root, flags: [], env: { npm_config_prefix: other.prefix } }),
+    ).rejects.toThrow(/launcher defers to the npm under its configured prefix/);
+  });
+
+  it('ignores the prefix outside the Windows layout, where bin/npm links to npm-cli.js', async () => {
+    const { npmDir } = fakeNpm();
+    const other = fakeNpm({ layout: 'windows', prefixName: 'other' });
+    const { loadConfig } = loadNpmInternals(npmDir);
+    await expect(
+      loadConfig?.({ cwd: root, flags: [], env: { npm_config_prefix: other.prefix } }),
+    ).resolves.toBeDefined();
   });
 });

@@ -14,7 +14,7 @@
  */
 
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
@@ -37,10 +37,18 @@ export interface Scenario {
    * an .npmrc cannot carry, such as ones containing a newline.
    */
   readonly env?: Readonly<Record<string, string>>;
+  /**
+   * Publish a packed tarball of the manifest instead of the directory. The
+   * working directory then holds a *different*, unscoped manifest, so the
+   * archive's own manifest has to be the one that decides.
+   */
+  readonly tarball?: boolean;
 }
 
 export interface Project {
   readonly dir: string;
+  /** The archive to publish, when the scenario publishes a tarball. */
+  readonly tarball?: string;
   remove(): void;
 }
 
@@ -56,11 +64,28 @@ export function makeProject(scenario: Scenario): Project {
   if (scenario.publishConfig !== undefined) {
     manifest['publishConfig'] = scenario.publishConfig;
   }
-  writeFileSync(path.join(dir, 'package.json'), JSON.stringify(manifest));
+  let tarball: string | undefined;
+  if (scenario.tarball) {
+    // The archive carries the scenario's manifest; the directory npm runs
+    // in carries an unrelated one, which must not be what decides.
+    const staging = path.join(dir, '.staging', 'package');
+    mkdirSync(staging, { recursive: true });
+    writeFileSync(path.join(staging, 'package.json'), JSON.stringify(manifest));
+    tarball = path.join(dir, '.staging', 'pkg.tgz');
+    const packed = spawnSync('tar', ['-czf', tarball, '-C', path.dirname(staging), 'package']);
+    if (packed.status !== 0) throw new Error('could not pack the scenario tarball');
+    writeFileSync(path.join(dir, 'package.json'), '{"name":"working-directory","version":"0.0.0"}');
+  } else {
+    writeFileSync(path.join(dir, 'package.json'), JSON.stringify(manifest));
+  }
   if (scenario.npmrc !== undefined) {
     writeFileSync(path.join(dir, '.npmrc'), `${scenario.npmrc.join('\n')}\n`);
   }
-  return { dir, remove: () => rmSync(dir, { recursive: true, force: true }) };
+  return {
+    dir,
+    ...(tarball === undefined ? {} : { tarball }),
+    remove: () => rmSync(dir, { recursive: true, force: true }),
+  };
 }
 
 export type Outcome =
@@ -110,6 +135,7 @@ export function groundTruth(npmDir: string, scenario: Scenario): Outcome {
       [
         path.join(npmDir, 'bin', 'npm-cli.js'),
         'publish',
+        ...(project.tarball === undefined ? [] : [project.tarball]),
         '--dry-run',
         ...publishFlags(scenario.registryUrl),
       ],

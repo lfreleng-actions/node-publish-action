@@ -62,6 +62,22 @@ export interface PublishOptions {
   readonly applied: ReadonlySet<string>;
 }
 
+/**
+ * The publishConfig keys npm will apply: all of them before 10.5.2, and all
+ * but those set on the command line from then on. The single statement of
+ * that rule, used both to build the options and to validate values before
+ * npm sees them.
+ */
+export function appliedKeys(
+  config: LoadedConfig,
+  npmVersion: string,
+  publishConfig: Readonly<Record<string, unknown>> | undefined,
+): ReadonlySet<string> {
+  if (!publishConfig) return new Set();
+  const filter = meetsVersion(npmVersion, CLI_FILTER_SINCE);
+  return new Set(Object.keys(publishConfig).filter((key) => !(filter && config.cliKeys.has(key))));
+}
+
 /** Build the options `npm publish` would give pickRegistry. */
 export function publishOptions(
   config: LoadedConfig,
@@ -71,13 +87,10 @@ export function publishOptions(
   // A copy: npm caches `flat` and reuses it, and its own publish command
   // flattens publishConfig into a copy for the same reason.
   const opts: Record<string, unknown> = { ...config.flat };
-  if (!publishConfig) {
-    return { opts, applied: new Set() };
+  const applied = appliedKeys(config, npmVersion, publishConfig);
+  if (publishConfig && applied.size > 0) {
+    const kept = Object.entries(publishConfig).filter(([key]) => applied.has(key));
+    config.flatten(Object.fromEntries(kept), opts);
   }
-  const filter = meetsVersion(npmVersion, CLI_FILTER_SINCE);
-  const kept = Object.entries(publishConfig).filter(
-    ([key]) => !(filter && config.cliKeys.has(key)),
-  );
-  config.flatten(Object.fromEntries(kept), opts);
-  return { opts, applied: new Set(kept.map(([key]) => key)) };
+  return { opts, applied };
 }

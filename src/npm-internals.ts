@@ -26,12 +26,24 @@
  * | 9+    | yes          | yes, definitions in config    |
  */
 
-import { realpathSync, readFileSync, statSync } from 'node:fs';
+import { realpathSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import path from 'node:path';
 
-/** Raised when npm's internals cannot be located or loaded. */
-export class NpmInternalsError extends Error {}
+import { assertLauncherRunsTree, locateNpm } from './npm-locate.js';
+import { readManifestFrom, type Manifest, type ManifestTarget } from './npm-manifest.js';
+import {
+  assertClosureInTree,
+  loadResolved,
+  NpmInternalsError,
+  resolveInTree,
+  type NpmTree,
+} from './npm-tree.js';
+
+export { NpmInternalsError };
+export { locateNpm } from './npm-locate.js';
+export { manifestFields } from './npm-manifest.js';
+export type { Manifest, ManifestTarget } from './npm-manifest.js';
 
 /** The layer a configuration value came from, as npm names it. */
 export type ConfigLayer = 'default' | 'builtin' | 'global' | 'user' | 'project' | 'env' | 'cli';
@@ -41,9 +53,19 @@ export type PickRegistry = (spec: string, opts: Readonly<Record<string, unknown>
 
 /** The slice of a loaded `@npmcli/config` instance this action relies on. */
 export interface LoadedConfig {
-  /** The effective value of `key`, or undefined when no layer sets it. */
+  /**
+   * The effective value of `key`.
+   *
+   * Undefined means only that no value was *usable*. A literal
+   * `key=undefined` in an .npmrc also yields undefined, so use find() to
+   * tell absent from set; reading get() alone recreates the sentinel
+   * ambiguity that `npm config get` had.
+   */
   get(key: string): unknown;
-  /** The layer that set `key`, or null when none did. */
+  /**
+   * The layer that set `key`, or null when none did. The authoritative
+   * answer to whether a key is present at all.
+   */
   find(key: string): ConfigLayer | null;
   /**
    * The flattened options npm passes to its registry code.
@@ -96,6 +118,16 @@ export interface NpmInternals {
    * which predates `@npmcli/config`.
    */
   readonly loadConfig: ((options: LoadConfigOptions) => Promise<LoadedConfig>) | undefined;
+  /**
+   * Read the manifest `npm publish` would read, normalised as npm
+   * normalises it: the name trimmed, for one, which decides the scope.
+   * Reading package.json raw would let `" @s/p "` look unscoped while npm
+   * publishes it as `@s/p`.
+   */
+  readonly readManifest: (
+    target: ManifestTarget,
+    opts: Readonly<Record<string, unknown>>,
+  ) => Promise<Manifest>;
 }
 
 /**
@@ -121,84 +153,17 @@ interface ConfigInstance {
   find(key: string): string | null;
   readonly flat: Record<string, unknown>;
   readonly data?: Map<string, { raw?: Record<string, unknown> }>;
+  readonly globalPrefix?: unknown;
   validate?: () => boolean;
 }
 
 type ConfigConstructor = new (options: Record<string, unknown>) => ConfigInstance;
 
-function isExecutableFile(candidate: string): boolean {
-  try {
-    const stats = statSync(candidate);
-    // Any execute bit: the runner resolves commands for its own user, and
-    // a stricter check would need uid/gid comparisons that add nothing
-    // here, since spawning is what finally proves it.
-    return stats.isFile() && (stats.mode & 0o111) !== 0;
-  } catch {
-    return false;
-  }
-}
-
-function packageName(dir: string): string | undefined {
-  try {
-    const parsed: unknown = JSON.parse(readFileSync(path.join(dir, 'package.json'), 'utf8'));
-    if (parsed && typeof parsed === 'object' && 'name' in parsed) {
-      const { name } = parsed as { name: unknown };
-      return typeof name === 'string' ? name : undefined;
-    }
-  } catch {
-    // Missing or unreadable: not the npm package.
-  }
-  return undefined;
-}
-
-/**
- * The directory of the npm package that `npm` on `PATH` runs.
- *
- * Resolved from the executable rather than asked of npm (`npm root -g`),
- * because the answer to that question is itself configuration: a project
- * `.npmrc` setting `prefix` moves it to where npm is not installed. The
- * executable is what `npm publish` will actually run.
- */
-export function locateNpm(pathEnv: string | undefined = process.env['PATH']): string {
-  for (const entry of (pathEnv ?? '').split(path.delimiter)) {
-    if (entry === '') continue;
-    const candidate = path.join(entry, 'npm');
-    if (!isExecutableFile(candidate)) continue;
-
-    let dir = path.dirname(realpathSync(candidate));
-    // setup-node and npm's own installer both link bin/npm to
-    // <prefix>/lib/node_modules/npm/bin/npm-cli.js; walking up from the
-    // real target finds the package whatever the depth.
-    for (;;) {
-      if (packageName(dir) === 'npm') return dir;
-      const parent = path.dirname(dir);
-      if (parent === dir) break;
-      dir = parent;
-    }
-    // The first npm on PATH is the one that runs. Settling for a later
-    // one would load internals from an npm that does not publish.
-    throw new NpmInternalsError(
-      `The 'npm' found on PATH at ${candidate} does not resolve to an npm ` +
-        'package directory. Install npm through actions/setup-node, or ' +
-        "ensure the first 'npm' on PATH is a standard npm installation.",
-    );
-  }
-  throw new NpmInternalsError(
-    "No 'npm' executable found on PATH. This step runs after " +
-      'actions/setup-node, which should have provided one.',
-  );
-}
-
-function loadDefinitions(req: NodeJS.Require, npmVersion: string): Definitions {
+function loadDefinitions(req: NodeJS.Require, npmRoot: string, npmVersion: string): Definitions {
   for (const location of DEFINITION_LOCATIONS) {
-    let loaded: unknown;
-    try {
-      loaded = req(location);
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === 'MODULE_NOT_FOUND') continue;
-      throw err;
-    }
-    const defs = loaded as Partial<Definitions>;
+    const resolved = resolveInTree(req, location, npmRoot);
+    if (resolved === undefined) continue;
+    const defs = loadResolved(req, resolved, `'${location}'`, npmVersion) as Partial<Definitions>;
     if (
       defs.definitions && typeof defs.definitions === 'object' &&
       defs.shorthands && typeof defs.shorthands === 'object' &&
@@ -218,92 +183,120 @@ function loadDefinitions(req: NodeJS.Require, npmVersion: string): Definitions {
   );
 }
 
+/** Load npm's layered configuration for a project, as npm itself does. */
+async function loadConfigFrom(
+  Config: ConfigConstructor,
+  tree: NpmTree,
+  { cwd, flags, env }: LoadConfigOptions,
+): Promise<LoadedConfig> {
+  const { req, npmDir, npmRoot, npmVersion } = tree;
+  const defs = loadDefinitions(req, npmRoot, npmVersion);
+  const instance = new Config({
+    definitions: defs.definitions,
+    shorthands: defs.shorthands,
+    flatten: defs.flatten,
+    npmPath: npmDir,
+    // nopt skips the first two entries, as it would for
+    // `node npm-cli.js <flags>`.
+    argv: [process.execPath, path.join(npmDir, 'bin', 'npm-cli.js'), ...flags],
+    cwd,
+    env,
+  });
+  await instance.load();
+  assertLauncherRunsTree(instance.globalPrefix, tree);
+  // Materialise the flattened options now, before anything else touches
+  // the configuration. npm does exactly this: npm.js reads flatOptions
+  // straight after config.load(), and only then constructs the command,
+  // whose constructor runs validate(). validate() coerces values in place
+  // -- on npm 9 and later it turns a parsed `scope=null` into the string
+  // "null" -- but the cached flat object npm publishes with was built
+  // beforehand, so npm never sees the coercion. Reading flat after
+  // validate() would.
+  const flat = instance.flat;
+  const flatten = defs.flatten as (
+    source: Readonly<Record<string, unknown>>,
+    target: Record<string, unknown>,
+  ) => void;
+  const cliKeys = new Set(Object.keys(instance.data?.get('cli')?.raw ?? {}));
+  return {
+    get: (key) => instance.get(key),
+    find: (key) => instance.find(key) as ConfigLayer | null,
+    get flat() {
+      return flat;
+    },
+    cliKeys,
+    flatten: (source, target) => flatten(source, target),
+    validate: () => {
+      // Present on every npm from 7 to 11; guarded, not assumed.
+      if (typeof instance.validate !== 'function') return;
+      try {
+        instance.validate();
+      } catch (err) {
+        const code = (err as NodeJS.ErrnoException).code ?? 'EINVALID';
+        throw new NpmInternalsError(
+          `npm ${npmVersion} rejects its configuration (${code}), so ` +
+            'npm publish would fail. Check the .npmrc files and ' +
+            'npm_config_* variables in effect for this project.',
+        );
+      }
+    },
+  };
+}
+
 /** Load npm's internals from the npm package at `npmDir`. */
 export function loadNpmInternals(npmDir: string = locateNpm()): NpmInternals {
-  const req = createRequire(path.join(npmDir, 'package.json'));
+  const npmRoot = realpathSync(npmDir);
+  const req = createRequire(path.join(npmRoot, 'package.json'));
 
   const npmVersion = (req('./package.json') as { version?: unknown }).version;
   if (typeof npmVersion !== 'string') {
     throw new NpmInternalsError(`${npmDir} has no npm version in package.json.`);
   }
+  // Before any of npm's code runs: every module it could require, however
+  // deep and however late, must be the one npm ships.
+  assertClosureInTree(npmRoot, npmVersion);
+  const major = Number(npmVersion.split('.')[0]);
 
-  let pickRegistry: unknown;
-  try {
-    pickRegistry = (req('npm-registry-fetch') as { pickRegistry?: unknown }).pickRegistry;
-  } catch (err) {
+  const fetchPath = resolveInTree(req, 'npm-registry-fetch', npmRoot);
+  if (fetchPath === undefined) {
     throw new NpmInternalsError(
       `npm ${npmVersion}: cannot load npm-registry-fetch from its own tree ` +
-        `(${(err as Error).message.split('\n')[0]}).`,
+        '(not found).',
     );
   }
+  const pickRegistry = (
+    loadResolved(req, fetchPath, 'npm-registry-fetch', npmVersion) as { pickRegistry?: unknown }
+  ).pickRegistry;
   if (typeof pickRegistry !== 'function') {
     throw new NpmInternalsError(`npm ${npmVersion}: npm-registry-fetch exports no pickRegistry.`);
   }
 
-  let Config: ConfigConstructor | undefined;
-  try {
-    Config = req('@npmcli/config') as ConfigConstructor;
-  } catch (err) {
-    // npm 6 predates @npmcli/config. Any other failure is a real fault.
-    if ((err as NodeJS.ErrnoException).code !== 'MODULE_NOT_FOUND') throw err;
+  // Absence is expected only on npm 6, which predates @npmcli/config. On any
+  // later npm a missing copy is a broken installation, not a capability
+  // gap, and reporting it as one would quietly change what is checked.
+  const configPath = resolveInTree(req, '@npmcli/config', npmRoot);
+  if (configPath === undefined && major >= 7) {
+    throw new NpmInternalsError(
+      `npm ${npmVersion}: @npmcli/config is missing from its own tree, ` +
+        'though every npm from 7 ships it. The installation is incomplete.',
+    );
   }
+  const Config =
+    configPath === undefined
+      ? undefined
+      : (loadResolved(req, configPath, '@npmcli/config', npmVersion) as ConfigConstructor);
 
+  const tree: NpmTree = { req, npmDir, npmRoot, npmVersion };
   const loadConfig =
     Config === undefined
       ? undefined
-      : async ({ cwd, flags, env }: LoadConfigOptions): Promise<LoadedConfig> => {
-          const defs = loadDefinitions(req, npmVersion);
-          const instance = new (Config as ConfigConstructor)({
-            definitions: defs.definitions,
-            shorthands: defs.shorthands,
-            flatten: defs.flatten,
-            npmPath: npmDir,
-            // nopt skips the first two entries, as it would for
-            // `node npm-cli.js <flags>`.
-            argv: [process.execPath, path.join(npmDir, 'bin', 'npm-cli.js'), ...flags],
-            cwd,
-            env,
-          });
-          await instance.load();
-          // Materialise the flattened options now, before anything else
-          // touches the configuration. npm does exactly this: npm.js reads
-          // flatOptions straight after config.load(), and only then
-          // constructs the command, whose constructor runs validate().
-          // validate() coerces values in place -- on npm 9 and later it
-          // turns a parsed `scope=null` into the string "null" -- but the
-          // cached flat object npm publishes with was built beforehand, so
-          // npm never sees the coercion. Reading flat after validate()
-          // would.
-          const flat = instance.flat;
-          const flatten = defs.flatten as (
-            source: Readonly<Record<string, unknown>>,
-            target: Record<string, unknown>,
-          ) => void;
-          const cliKeys = new Set(Object.keys(instance.data?.get('cli')?.raw ?? {}));
-          return {
-            get: (key) => instance.get(key),
-            find: (key) => instance.find(key) as ConfigLayer | null,
-            get flat() {
-              return flat;
-            },
-            cliKeys,
-            flatten: (source, target) => flatten(source, target),
-            validate: () => {
-              // Present on every npm from 7 to 11; guarded, not assumed.
-              if (typeof instance.validate !== 'function') return;
-              try {
-                instance.validate();
-              } catch (err) {
-                const code = (err as NodeJS.ErrnoException).code ?? 'EINVALID';
-                throw new NpmInternalsError(
-                  `npm ${npmVersion} rejects its configuration (${code}), so ` +
-                    'npm publish would fail. Check the .npmrc files and ' +
-                    'npm_config_* variables in effect for this project.',
-                );
-              }
-            },
-          };
-        };
+      : (options: LoadConfigOptions) => loadConfigFrom(Config, tree, options);
 
-  return { npmVersion, npmDir, pickRegistry: pickRegistry as PickRegistry, loadConfig };
+  return {
+    npmVersion,
+    npmDir,
+    pickRegistry: pickRegistry as PickRegistry,
+    loadConfig,
+    readManifest: (target, opts) => readManifestFrom(tree, target, opts),
+  };
 }
