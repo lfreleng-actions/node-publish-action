@@ -9,37 +9,25 @@
  * somewhere the action never names: the summary misreports the destination
  * and `npm view` checks the wrong host.
  *
- * The selection follows `pickRegistry` in npm-registry-fetch:
+ * **npm decides.** The registry is whatever the publishing npm's own
+ * `pickRegistry` returns for the options its publish command would build
+ * (see publish-options.ts). This module does not reimplement that
+ * selection. It does three things npm cannot do for it:
  *
- *   let registry = spec.scope && opts[spec.scope + ':registry']
- *   if (!registry && opts.scope) {
- *     registry = opts[opts.scope + ':registry']
- *   }
- *   if (!registry) { registry = opts.registry || defaultOpts.registry }
+ * - **Attribute** the result to a source, for the summary and the notice.
+ * - **Cross-check** the attribution against npm's answer and fail closed
+ *   when they disagree, so a mislabelled source can never ship.
+ * - **Validate** the result, so an override cannot bring in a registry
+ *   that registry_url's own validation would refuse (registry-url.ts).
  *
- * `opts` is the resolved configuration with the manifest's `publishConfig`
- * flattened over it — **except** for keys already supplied on the command
- * line, which npm filters out. Each rule below was checked against npm
- * 11.19.0 rather than read from the source alone:
- *
- * | Case                                        | Winner        |
- * | ------------------------------------------- | ------------- |
- * | `publishConfig.registry` vs `--registry`     | `--registry`  |
- * | `publishConfig["@s:registry"]` vs `--registry` | publishConfig |
- * | `publishConfig["@s:registry"]` vs `--@s:registry` | the CLI   |
- * | unscoped package, `scope=@s` + `@s:registry` | `@s:registry` |
- *
- * Row one is why `publishConfig.registry` is consulted only when this
- * action passes no `--registry` at all. Row three is what lets the caller
- * make a resolved value authoritative. Row four is the `opts.scope`
- * fallback, which applies to packages that are not themselves scoped.
- *
- * Only the *selection* lives here. Reading `.npmrc` is left to npm: the
- * caller supplies what `npm config get` returned, so this module never
- * parses npm configuration.
+ * Precedence is not tested here. It varies by npm release, so it is tested
+ * against `npm publish --dry-run` on every supported npm, from
+ * MINIMUM_NPM_MAJOR up, in test/registry.parity.test.ts.
  */
 
-
+import type { LoadedConfig, PickRegistry } from './npm-internals.js';
+import { NpmInternalsError } from './npm-internals.js';
+import { appliedKeys, publishOptions } from './publish-options.js';
 import { assertUsable, RegistryError } from './registry-url.js';
 import type { RegistrySource } from './registry-source.js';
 
@@ -48,6 +36,30 @@ export type { RegistrySource };
 
 /** Where npm publishes with no registry configured anywhere. */
 const NPM_DEFAULT_REGISTRY = 'https://registry.npmjs.org/';
+
+/**
+ * The oldest npm major this resolver supports: the oldest whose behaviour
+ * is verified, since the parity tests compare every scenario against
+ * `npm publish --dry-run`, and npm 7's dry run never names a destination.
+ * npm 7 also differs in substance: it flattens `scope` to `projectScope`
+ * while its npm-registry-fetch reads `opts.scope`, so a configured scope
+ * never redirects there. Nothing current needs it. No Node.js LTS release
+ * shipped npm 7, only Node 15 and the pre-LTS Node 16 releases, the last
+ * in September 2021.
+ */
+export const MINIMUM_NPM_MAJOR = 8;
+
+/** Refuse an npm older than the verified floor. */
+export function assertSupportedNpm(npmVersion: string): void {
+  const major = Number(npmVersion.split('.')[0]);
+  if (Number.isInteger(major) && major >= MINIMUM_NPM_MAJOR) return;
+  throw new NpmInternalsError(
+    `npm ${npmVersion} is older than npm ${MINIMUM_NPM_MAJOR}, the oldest ` +
+      'release this action resolves publish registries for. Every Node.js ' +
+      `LTS release ships npm ${MINIMUM_NPM_MAJOR} or later; raise ` +
+      'node_version, or the version in node_version_file.',
+  );
+}
 
 export interface RegistryResolution {
   /** The registry npm will publish to. */
@@ -74,23 +86,18 @@ export interface RegistryResolution {
 export interface RegistryInputs {
   readonly packageName: string;
   readonly publishConfig: Readonly<Record<string, unknown>> | undefined;
-  /** Result of `npm config get <scope>:registry` per consulted scope. */
-  readonly npmConfigScopedRegistry: Readonly<Record<string, string | undefined>>;
-  /** Result of `npm config get scope`, npm's configured default scope. */
-  readonly npmConfigScope: string | undefined;
-  /**
-   * Result of `npm config get registry`, npm's configured default.
-   *
-   * Only consulted when this action passes no `--registry`, which is the
-   * one case where npm falls back to it rather than to the caller's
-   * value. Returning an empty registry there would report `(none)` while
-   * npm quietly contacted the project's or user's own registry.
-   */
-  readonly npmConfigRegistry: string | undefined;
   /** The action's registry_url input. May be empty for a dry run. */
   readonly registryUrl: string;
+  /**
+   * The publishing npm's configuration for the project, loaded with the
+   * flags the publish step passes (`--registry` when registryUrl is set).
+   */
+  readonly config: LoadedConfig;
+  /** That npm's version; decides which publishConfig keys it applies. */
+  readonly npmVersion: string;
+  /** That npm's own pickRegistry. */
+  readonly pickRegistry: PickRegistry;
 }
-
 
 /**
  * The scope of a package name, including the leading '@'.
@@ -111,256 +118,189 @@ export function scopeOf(packageName: string): string | null {
 }
 
 /**
- * Normalise npm's configured `scope`, which may omit the leading '@'.
+ * Refuse a truthy non-string where npm expects a registry or scope.
  *
- * The literals `cleanConfigValue` discards are exactly the ones npm
- * ignores, measured on npm 11.19.0 by publishing against an
- * `@<scope>:registry` entry for each:
+ * npm's flatten copies publishConfig entries across without checking their
+ * type, and npm then rejects the publish. Refusing here fails for the same
+ * reason npm does, rather than reporting a destination npm never reaches.
  *
- * | `scope=`    | `npm config get scope` | npm selects the scoped registry |
- * | ----------- | ---------------------- | ------------------------------- |
- * | *(unset)*   | *(empty)*              | no                              |
- * | `null`      | `null`                 | **no**                          |
- * | `undefined` | `@undefined`           | **yes**                         |
- * | `NULL`      | `@NULL`                | **yes**                         |
- * | `onap`      | `@onap`                | yes                             |
- *
- * npm normalises a usable value by prefixing '@' before printing it, so
- * anything it honours arrives here already distinguishable from the
- * renderings it does not. `null` is the one value npm discards itself,
- * and it prints unprefixed, so discarding it here agrees rather than
- * guesses. Treating these as real scopes would query and pin keys npm
- * never consults.
+ * The message names the key and the type, never the value. An object would
+ * otherwise be serialised into an ::error::, publishing whatever manifest
+ * fields it happened to carry into the job log.
  */
-function normaliseScope(value: string | undefined): string | null {
-  return prefixScope(cleanConfigValue(value));
-}
-
-/** Add the leading '@' npm expects, treating only an absent value as none. */
-function prefixScope(value: string | undefined): string | null {
-  if (value === undefined) {
-    return null;
-  }
-  return value.startsWith('@') ? value : `@${value}`;
-}
-
-/**
- * npm prints the string 'undefined' for an unset key rather than writing
- * nothing, so an unguarded read turns a missing setting into a registry
- * literally named 'undefined'.
- */
-function cleanConfigValue(value: string | undefined): string | undefined {
-  if (value === undefined) {
-    return undefined;
-  }
-  const trimmed = value.trim();
-  if (trimmed === '' || trimmed === 'undefined' || trimmed === 'null') {
-    return undefined;
-  }
-  return trimmed;
-}
-
-interface ManifestEntry {
-  /**
-   * Whether the key exists in publishConfig at all.
-   *
-   * A present key matters even when empty: npm flattens it over the
-   * resolved options, masking any `.npmrc` value for the same key. The
-   * selection then falls past it rather than back to configuration.
-   */
-  readonly present: boolean;
-  readonly value: string | undefined;
-}
-
-function readPublishConfig(
+function assertManifestString(
   publishConfig: Readonly<Record<string, unknown>> | undefined,
   key: string,
-): ManifestEntry {
-  if (!publishConfig || typeof publishConfig !== 'object' || !(key in publishConfig)) {
-    return { present: false, value: undefined };
-  }
+): void {
+  if (!publishConfig || !(key in publishConfig)) return;
   const value = publishConfig[key];
-  // npm's flatten copies the entry across without checking its type, so
-  // JavaScript truthiness decides, not the declared type. Measured on
-  // npm 11.19.0: a scoped entry of 42 makes npm reject the publish
-  // outright rather than fall back.
-  //
-  // A truthy non-string is therefore rejected here, so this fails for
-  // the same reason npm does instead of silently selecting the .npmrc
-  // URL and publishing where npm would have refused.
-  //
-  // The message names the key and the type, never the value. An object
-  // would otherwise be serialised into an ::error:: -- publishing
-  // whatever manifest fields it happened to carry into the job log.
-  if (typeof value !== 'string') {
-    if (value) {
-      const kind = Array.isArray(value) ? 'an array' : `a ${typeof value}`;
-      throw new RegistryError(
-        `package.json publishConfig (${key}) is ${kind}, not a registry ` +
-          'URL. npm copies it through unchecked and then rejects the ' +
-          'publish, so it is refused here.',
-      );
-    }
-    return { present: true, value: undefined };
-  }
-  // Manifest data is not `npm config get` stdout, so the stdout
-  // conventions do not apply to it. npm copies the literal string into
-  // flatOptions, where only '' is falsey -- a literal 'undefined', 'null'
-  // or '   ' is selected, and npm then fails on it. Treating those as
-  // empty here would pin the fallback registry and publish somewhere npm
-  // would have refused to.
-  return { present: true, value: value === '' ? undefined : value };
+  if (typeof value === 'string' || !value) return;
+  const kind = Array.isArray(value) ? 'an array' : `a ${typeof value}`;
+  const expected = key === 'scope' ? 'a scope name' : 'a registry URL';
+  throw new RegistryError(
+    `package.json publishConfig (${key}) is ${kind}, not ${expected}. ` +
+      'npm copies it through unchecked and then rejects the publish, so ' +
+      'it is refused here.',
+  );
+}
+
+/** npm's configured scope, as its flatten normalised it, or null. */
+function optionScope(opts: Readonly<Record<string, unknown>>): string | null {
+  const scope = opts['scope'];
+  return typeof scope === 'string' && scope !== '' ? scope : null;
 }
 
 /**
- * The first scoped key npm would honour, or null when none applies.
+ * Refuse a consulted scope that cannot be pinned faithfully.
  *
- * Split out from the main resolution so each half stays readable; the
- * ordering it implements is pickRegistry's, described above.
+ * The publish and verification steps pin each consulted scope as
+ * `--<scope>:registry=<url>`. Two kinds of character break that:
+ *
+ * - **Control characters.** The scopes are emitted one per line and read
+ *   back line by line, so a line break would split a scope into keys npm
+ *   never consults. publishConfig.scope is JSON and an npm_config_scope
+ *   variable is unrestricted, so either can carry one.
+ * - **`=`.** npm's option parser splits a flag at its first `=`, so the
+ *   pin for `@a=b` is read as the key `@a` and the real key stays unpinned.
+ *   Measured on npm 8 and 11. An .npmrc cannot define such a key, since its
+ *   parser splits there too, but publishConfig can.
+ *
+ * Either way the real key would stay open for a lifecycle script to
+ * redirect. The value is never echoed: the character is named, by code
+ * point where it would corrupt the line reporting it.
  */
-function selectScoped(
-  inputs: RegistryInputs,
-  candidates: readonly string[],
-  registryUrl: string,
-): RegistryResolution | null {
-  for (const scope of candidates) {
-    const key = `${scope}:registry`;
-    const manifest = readPublishConfig(inputs.publishConfig, key);
-    if (manifest.present) {
-      if (manifest.value !== undefined) {
-        assertUsable(manifest.value, 'publishConfig-scoped', scope);
-        return {
-          registry: manifest.value,
-          source: 'publishConfig-scoped',
-          scope,
-          scopes: candidates,
-          overridden: manifest.value !== registryUrl,
-        };
-      }
-      // Present but empty. npm flattens it over the resolved options, so
-      // the .npmrc value for this key is masked and the selection moves
-      // on rather than falling back to configuration.
-      continue;
-    }
-    const configured = cleanConfigValue(inputs.npmConfigScopedRegistry[key]);
-    if (configured !== undefined) {
-      assertUsable(configured, 'npm-config-scoped', scope);
-      return {
-        registry: configured,
-        source: 'npm-config-scoped',
-        scope,
-        scopes: candidates,
-        overridden: configured !== registryUrl,
-      };
-    }
+function assertScopeText(scope: string, where: string): void {
+  const control = /[\u0000-\u001f\u007f]/.exec(scope);
+  if (control) {
+    const code = (control[0].codePointAt(0) ?? 0).toString(16).toUpperCase().padStart(4, '0');
+    throw new RegistryError(
+      `${where} contains a control character (U+${code}). Remove it: the ` +
+        'scope is pinned on the command line from a line-based list, and ' +
+        'cannot be pinned faithfully with one.',
+    );
   }
-  return null;
-}
-
-  // publishConfig.registry loses to --registry, because npm filters any
-  // publishConfig key already supplied as a command-line flag. It therefore
-  // only decides when this action passes no --registry at all, which
-  // happens for a dry run with no registry_url. Consulting it otherwise
-  // would redirect a publish npm would have sent to the caller's registry.
-function selectWithoutInput(
-  inputs: RegistryInputs,
-  candidates: readonly string[],
-  registryUrl: string,
-): RegistryResolution {
-  const manifest = readPublishConfig(inputs.publishConfig, 'registry');
-  if (manifest.value !== undefined) {
-    assertUsable(manifest.value, 'publishConfig-registry', null);
-    return {
-      registry: manifest.value,
-      source: 'publishConfig-registry',
-      scope: null,
-      scopes: candidates,
-      overridden: true,
-    };
+  if (scope.includes('=')) {
+    throw new RegistryError(
+      `${where} contains '='. Remove it: npm splits a command-line flag at ` +
+        "its first '=', so this scope's registry cannot be pinned.",
+    );
   }
-  // npm does not publish to "no registry". With no --registry it uses
-  // its own configured value, and failing that its built-in default --
-  // measured on npm 11.19.0, including that an explicitly empty
-  // publishConfig.registry masks the configured value and leaves the
-  // built-in default. Reporting '' here would name no destination
-  // while npm quietly contacted one, and would pin nothing.
-  //
-  // This key is not read through cleanConfigValue. Unlike a scoped key,
-  // `registry` is never printed as 'undefined' when unset -- npm prints
-  // its built-in default -- so 'undefined' or 'null' here is a value the
-  // user actually configured, and npm rejects the publish on it. Treating
-  // it as unset would publish to the default where npm refused.
-  const rawConfigured = (inputs.npmConfigRegistry ?? '').trim();
-  const configured = manifest.present || rawConfigured === '' ? undefined : rawConfigured;
-  const fallback = configured ?? NPM_DEFAULT_REGISTRY;
-  assertUsable(fallback, 'npm-config-registry', null);
-  return {
-    registry: fallback,
-    source: 'npm-config-registry',
-    scope: null,
-    scopes: candidates,
-    // Derived, not assumed. This branch runs when registry_url is
-    // empty, so the fallback always differs from it -- and the notice
-    // is exactly what tells a caller their empty input did not mean
-    // "no registry".
-    overridden: fallback !== registryUrl,
-  };
 }
 
 /**
- * Resolve the registry npm will publish to, following npm's own precedence.
+ * Name the source of the key that decided.
  *
- * Throws {@link RegistryError} when the winning value is unusable, so an
- * override cannot smuggle in an http registry that registry_url's own
- * validation would have refused.
+ * A manifest key counts only when it supplied the value. An empty one
+ * masks the configured value without supplying a URL of its own, so npm's
+ * default applies and the manifest is not the source. Likewise 'input' is
+ * claimed only when the result is the caller's own URL.
+ */
+function sourceOf(
+  key: string,
+  registry: unknown,
+  inputs: RegistryInputs,
+  applied: ReadonlySet<string>,
+): RegistrySource {
+  const scoped = key !== 'registry';
+  if (applied.has(key) && inputs.publishConfig?.[key]) {
+    return scoped ? 'publishConfig-scoped' : 'publishConfig-registry';
+  }
+  if (scoped) {
+    return 'npm-config-scoped';
+  }
+  // The registry key from the command line is the one this action passes,
+  // but only if the manifest did not mask it. Before npm 10.5.2 an applied
+  // publishConfig.registry overrides the flag; a truthy one returned above,
+  // so an applied one here is empty, and npm fell through to its default.
+  // That default can equal registry_url, which makes the values match while
+  // the flag played no part.
+  const fromInput =
+    !applied.has('registry') &&
+    inputs.config.find('registry') === 'cli' &&
+    registry === inputs.registryUrl.trim();
+  return fromInput ? 'input' : 'npm-config-registry';
+}
+
+/**
+ * Resolve the registry npm will publish to, using npm's own selection.
+ *
+ * Throws {@link RegistryError} when the winning value is unusable, and
+ * {@link NpmInternalsError} when npm itself would refuse the configuration
+ * or when attribution disagrees with npm.
  */
 export function resolveEffectiveRegistry(inputs: RegistryInputs): RegistryResolution {
+  const { config, publishConfig } = inputs;
   const registryUrl = inputs.registryUrl.trim();
-  const specScope = scopeOf(inputs.packageName);
-  // npm flattens publishConfig.scope over the configured scope before
-  // pickRegistry reads opts.scope, so the manifest wins when present --
-  // and a present-but-empty entry masks the .npmrc value rather than
-  // deferring to it. Measured on npm 11.19.0: an unscoped package with
-  // publishConfig.scope '@other' published to '@other:registry', and an
-  // empty publishConfig.scope beside an .npmrc 'scope=@onap' fell
-  // through to --registry.
+
+  // Only verified behaviour is reported; see MINIMUM_NPM_MAJOR.
+  assertSupportedNpm(inputs.npmVersion);
+
+  // npm refuses some configuration outright; npm 9 and later reject an
+  // invalid `registry=` in an .npmrc, where npm 8 drops it. Following npm
+  // means asking it, not deciding here.
+  config.validate();
+
+  // Manifest types are checked before npm's flatten sees the values, so
+  // an invalid one is always reported here, in these terms, and never as
+  // whatever npm's own code throws on it. For `registry` that is
+  // `output.endsWith is not a function`, from pacote building a fetcher,
+  // later in npm's publish; flatten copies the value through untouched.
   //
-  // The manifest value is not `npm config get` output, so the stdout
-  // sentinels do not apply: a publishConfig.scope of 'undefined' is a
-  // real scope, '@undefined', which npm flattens through unchanged.
-  const manifestScope = readPublishConfig(inputs.publishConfig, 'scope');
-  const configScope = manifestScope.present
-    ? prefixScope(manifestScope.value)
-    : normaliseScope(inputs.npmConfigScope);
+  // Only keys npm will apply are checked, so the verdict tracks npm's: a
+  // non-string publishConfig.registry crashes npm whenever it is applied,
+  // even when a scoped key wins, and is harmless where npm filters it
+  // (10.5.2 and later, with --registry). `scope` is always applied, since
+  // this action never passes it on the command line.
+  const willApply = appliedKeys(config, inputs.npmVersion, publishConfig);
+  if (willApply.has('scope')) assertManifestString(publishConfig, 'scope');
+  if (willApply.has('registry')) assertManifestString(publishConfig, 'registry');
 
-  // pickRegistry consults the spec's scope first, then npm's configured
-  // default scope. The second is easy to miss: it redirects packages that
-  // are not themselves scoped.
-  const candidates: string[] = [];
-  for (const candidate of [specScope, configScope]) {
-    if (candidate && !candidates.includes(candidate)) {
-      candidates.push(candidate);
-    }
+  const { opts, applied } = publishOptions(config, inputs.npmVersion, publishConfig);
+
+  const registry: unknown = inputs.pickRegistry(inputs.packageName, opts);
+
+  // Attribute the result: the first consulted key npm would find set.
+  // This restates only pickRegistry's order, to *label* the answer; the
+  // answer itself is npm's, and the two are checked against each other.
+  const specScope = scopeOf(inputs.packageName);
+  const configuredScope = optionScope(opts);
+  const scopes: string[] = [];
+  for (const candidate of [specScope, configuredScope]) {
+    if (candidate && !scopes.includes(candidate)) scopes.push(candidate);
+  }
+  if (specScope) assertScopeText(specScope, 'the package name');
+  if (configuredScope) {
+    assertScopeText(
+      configuredScope,
+      applied.has('scope') ? 'package.json publishConfig (scope)' : 'npm config scope',
+    );
+  }
+  const winner = scopes.find((scope) => opts[`${scope}:registry`]);
+  const key = winner ? `${winner}:registry` : 'registry';
+  const expected = winner ? opts[key] : (opts['registry'] || NPM_DEFAULT_REGISTRY);
+
+  if (expected !== registry) {
+    throw new NpmInternalsError(
+      `npm ${inputs.npmVersion}: pickRegistry chose a registry this action ` +
+        `did not attribute to '${key}'. Refusing to report a source it ` +
+        'cannot account for; this npm may select registries differently.',
+    );
   }
 
-  const scoped = selectScoped(inputs, candidates, registryUrl);
-  if (scoped) {
-    return scoped;
+  if (winner && applied.has(key)) {
+    // Only a manifest value can be a non-string; configuration is text.
+    assertManifestString(publishConfig, key);
   }
 
-  if (registryUrl === '') {
-    return selectWithoutInput(inputs, candidates, registryUrl);
-  }
+  const source = sourceOf(key, registry, inputs, applied);
+  const scope = winner ?? null;
+  assertUsable(registry as string, source, source === 'input' ? specScope : scope);
 
-  assertUsable(registryUrl, 'input', specScope);
-  // The scopes are still reported when nothing overrode, so the publish and
-  // verification commands can pin those keys and keep a later publishConfig
-  // -- one written by prepublishOnly, say -- from moving the destination.
   return {
-    registry: registryUrl,
-    source: 'input',
-    scope: null,
-    scopes: candidates,
-    overridden: false,
+    registry: registry as string,
+    source,
+    scope,
+    scopes,
+    overridden: registry !== registryUrl,
   };
 }

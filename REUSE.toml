@@ -6,7 +6,13 @@ version = 1
 # JSON admits no comment syntax, so these files carry their copyright and
 # licence information here rather than in a header.
 [[annotations]]
-path = ["package.json", "package-lock.json", "tsconfig.json"]
+path = [
+  "package.json",
+  "package-lock.json",
+  "tsconfig.json",
+  "test/npm-versions/*/package.json",
+  "test/npm-versions/*/package-lock.json",
+]
 precedence = "aggregate"
 SPDX-FileCopyrightText = "2026 The Linux Foundation"
 SPDX-License-Identifier = "Apache-2.0"

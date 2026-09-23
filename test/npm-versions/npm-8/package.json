@@ -1,0 +1,9 @@
+{
+  "name": "npm-versions-npm-8",
+  "version": "0.0.0",
+  "private": true,
+  "license": "Apache-2.0",
+  "dependencies": {
+    "npm": "8.19.4"
+  }
+}

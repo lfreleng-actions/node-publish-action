@@ -1048,6 +1048,81 @@ jobs:
           # Run unit tests
           npm test
 
+  ### Load npm's internals from every supported npm major ###
+  # The action loads pickRegistry and @npmcli/config from the npm that will
+  # publish, rather than bundling or transcribing them. That layout is not
+  # a public API, so exercise it on each major the action supports. A
+  # relocation in a new npm then fails here, naming the npm, instead of in
+  # a consumer's publish.
+  test-npm-internals:
+    name: "Test: npm internals across npm majors"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      # Load the egress allow-list out-of-band from the
+      # organisation's .github repository and publish it as
+      # $CONNECTION_ALLOW_LIST for the harden-runner step below.
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@805eedb0508c07714b61887a2b87a5c4bbeff22a # v0.12.1
+        with:
+          config: '@807a544b7e55a9224b2b3780e636467bd4b5b99b' # v0.5.0
+
+      # Harden the runner with the just-loaded allow-list.
+      - name: "Harden runner (block)"
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Checkout repository"
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: "Setup Node.js"
+        # yamllint disable-line rule:line-length
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+          cache: 'npm'
+
+      - name: "Install dependencies"
+        shell: bash
+        run: |
+          # Install dependencies
+          npm ci --no-audit --no-fund
+
+      - name: "Install each npm side by side"
+        shell: bash
+        run: |
+          # Install each npm side by side
+          # One directory per npm, each from its own committed lockfile, so
+          # every run exercises the same npm builds: resolving npm@6 afresh
+          # would test whatever shipped last. None is installed globally,
+          # so the npm on PATH stays the toolchain's. npm 6 predates
+          # @npmcli/config and covers registry selection alone; the suite
+          # gates the rest by version.
+          dirs=()
+          for fixture in test/npm-versions/*/; do
+            npm ci --prefix "$fixture" --no-audit --no-fund --ignore-scripts
+            dirs+=("${GITHUB_WORKSPACE}/${fixture}node_modules/npm")
+          done
+          IFS=':'
+          echo "NPM_INTERNALS_DIRS=${dirs[*]}" >> "$GITHUB_ENV"
+
+      - name: "Run the loader and parity tests against each npm"
+        shell: bash
+        run: |
+          # Run the loader and parity tests against each npm
+          # Parity runs npm publish --dry-run offline against .invalid
+          # hosts, so nothing is contacted.
+          npx vitest run test/npm-internals.real.test.ts \
+            test/registry.parity.test.ts
+
   ### Verify the committed bundle matches the sources ###
   # GitHub runs this action straight from the repository, so dist/ has to
   # be committed. That makes it possible for the bundle to drift from src/,
