@@ -45,8 +45,31 @@ export interface LoadedConfig {
   get(key: string): unknown;
   /** The layer that set `key`, or null when none did. */
   find(key: string): ConfigLayer | null;
-  /** The flattened options npm passes to its registry code. */
+  /**
+   * The flattened options npm passes to its registry code.
+   *
+   * npm caches this object and reuses it, so treat it as read-only. npm's
+   * own publish command merges publishConfig into a copy; mutating this one
+   * would corrupt the configuration it came from.
+   */
   readonly flat: Readonly<Record<string, unknown>>;
+  /** Keys set on the command line, as npm parsed them. */
+  readonly cliKeys: ReadonlySet<string>;
+  /**
+   * npm's own flatten: apply `source` over `target` the way npm applies
+   * publishConfig. Mutates `target`.
+   */
+  flatten(source: Readonly<Record<string, unknown>>, target: Record<string, unknown>): void;
+  /**
+   * Reject configuration this npm would refuse to run with.
+   *
+   * Delegates to npm's own validation, so the verdict follows the npm
+   * that publishes: npm 9 and later refuse an invalid `registry=` in an
+   * `.npmrc`, while npm 8 drops it and uses the default. Throws
+   * {@link NpmInternalsError} naming npm's error code but never the value,
+   * which npm's own error carries verbatim, credentials included.
+   */
+  validate(): void;
 }
 
 export interface LoadConfigOptions {
@@ -97,6 +120,8 @@ interface ConfigInstance {
   get(key: string): unknown;
   find(key: string): string | null;
   readonly flat: Record<string, unknown>;
+  readonly data?: Map<string, { raw?: Record<string, unknown> }>;
+  validate?: () => boolean;
 }
 
 type ConfigConstructor = new (options: Record<string, unknown>) => ConfigInstance;
@@ -240,11 +265,42 @@ export function loadNpmInternals(npmDir: string = locateNpm()): NpmInternals {
             env,
           });
           await instance.load();
+          // Materialise the flattened options now, before anything else
+          // touches the configuration. npm does exactly this: npm.js reads
+          // flatOptions straight after config.load(), and only then
+          // constructs the command, whose constructor runs validate().
+          // validate() coerces values in place -- on npm 9 and later it
+          // turns a parsed `scope=null` into the string "null" -- but the
+          // cached flat object npm publishes with was built beforehand, so
+          // npm never sees the coercion. Reading flat after validate()
+          // would.
+          const flat = instance.flat;
+          const flatten = defs.flatten as (
+            source: Readonly<Record<string, unknown>>,
+            target: Record<string, unknown>,
+          ) => void;
+          const cliKeys = new Set(Object.keys(instance.data?.get('cli')?.raw ?? {}));
           return {
             get: (key) => instance.get(key),
             find: (key) => instance.find(key) as ConfigLayer | null,
             get flat() {
-              return instance.flat;
+              return flat;
+            },
+            cliKeys,
+            flatten: (source, target) => flatten(source, target),
+            validate: () => {
+              // Present on every npm from 7 to 11; guarded, not assumed.
+              if (typeof instance.validate !== 'function') return;
+              try {
+                instance.validate();
+              } catch (err) {
+                const code = (err as NodeJS.ErrnoException).code ?? 'EINVALID';
+                throw new NpmInternalsError(
+                  `npm ${npmVersion} rejects its configuration (${code}), so ` +
+                    'npm publish would fail. Check the .npmrc files and ' +
+                    'npm_config_* variables in effect for this project.',
+                );
+              }
             },
           };
         };
