@@ -1110,17 +1110,20 @@ jobs:
             --ignore-scripts
           base="${GITHUB_WORKSPACE}/test/npm-majors/node_modules"
           dirs=()
-          for major in 6 7 8 9 10 11; do
+          for major in 6 7 8 9 10.5.1 10.5.2 10 11; do
             dirs+=("${base}/npm-${major}")
           done
           IFS=':'
           echo "NPM_INTERNALS_DIRS=${dirs[*]}" >> "$GITHUB_ENV"
 
-      - name: "Run the loader against each npm"
+      - name: "Run the loader and parity tests against each npm"
         shell: bash
         run: |
-          # Run the loader against each npm
-          npx vitest run test/npm-internals.real.test.ts
+          # Run the loader and parity tests against each npm
+          # Parity runs npm publish --dry-run offline against .invalid
+          # hosts, so nothing is contacted.
+          npx vitest run test/npm-internals.real.test.ts \
+            test/registry.parity.test.ts
 
   ### Verify the committed bundle matches the sources ###
   # GitHub runs this action straight from the repository, so dist/ has to

@@ -4,18 +4,18 @@
 /**
  * Resolve the registry npm will publish to, and emit it for later steps.
  *
- * The selection rules live in src/registry.ts, unit tested there. This
- * entry point does the IO those rules cannot: reading the manifest and
- * asking npm for its resolved configuration.
+ * The selection is npm's: this loads the publishing npm's configuration
+ * and pickRegistry in-process (src/npm-internals.ts) and hands them to
+ * src/registry.ts. This entry point does the IO around that: reading the
+ * manifest, loading npm's configuration with the flags the publish step
+ * passes, and writing the outputs.
  *
- * `npm config get` is used rather than any parsing of .npmrc, so the
- * configuration half of the answer comes from npm itself and cannot drift
- * from it. publishConfig is read from the manifest, because `npm config`
- * does not load it at all -- which is exactly why this redirection was
- * invisible before.
+ * It used to shell out to `npm config get` and decode its stdout, where an
+ * unset key prints the string 'undefined'. That decoding is gone. npm's
+ * configuration is read directly, so there is no text to misread.
  *
- * Reads: PROJECT_DIR, REGISTRY_URL.
- * Writes: the 'registry' and 'registry_source' step outputs.
+ * Reads: PROJECT_DIR, REGISTRY_URL, TARBALL.
+ * Writes: the 'registry', 'registry_source' and 'registry_scopes' outputs.
  */
 
 import { spawnSync } from 'node:child_process';
@@ -24,27 +24,17 @@ import path from 'node:path';
 
 import { error, info, notice, setOutput } from '../actions-io.js';
 import {
+  loadNpmInternals,
+  NpmInternalsError,
+  type LoadedConfig,
+  type PickRegistry,
+} from '../npm-internals.js';
+import { publishFlags } from '../publish-options.js';
+import {
   RegistryError,
   resolveEffectiveRegistry,
-  scopeOf,
   type RegistryResolution,
 } from '../registry.js';
-
-/** `npm config get <key>`, or undefined when npm cannot be asked. */
-function npmConfigGet(key: string, cwd: string): string | undefined {
-  const result = spawnSync('npm', ['config', 'get', key], {
-    cwd,
-    encoding: 'utf8',
-    // A workspace-aware npm refuses some commands inside a workspace
-    // package with ENOWORKSPACES; disabling workspaces keeps this a
-    // plain configuration read.
-    env: { ...process.env, npm_config_workspaces: 'false' },
-  });
-  if (result.error || result.status !== 0) {
-    return undefined;
-  }
-  return result.stdout;
-}
 
 /**
  * The manifest npm will resolve the publish from.
@@ -89,52 +79,6 @@ function manifestFields(manifest: { name?: unknown; publishConfig?: unknown }): 
   };
 }
 
-/**
- * Ask npm for the registry of every scope it would consult.
- *
- * pickRegistry checks the spec's scope and then npm's configured default
- * scope, so both are queried. The second redirects packages that are not
- * themselves scoped, which is easy to overlook.
- */
-function scopedRegistries(
-  packageName: string,
-  publishConfig: Record<string, unknown> | undefined,
-  npmConfigScope: string | undefined,
-  cwd: string,
-): Record<string, string | undefined> {
-  const scopes = new Set<string>();
-  const specScope = scopeOf(packageName);
-  if (specScope) {
-    scopes.add(specScope);
-  }
-  // The configured scope the resolver will consult: publishConfig.scope
-  // when the manifest has the key (even empty, which masks), else npm's
-  // own. Mirrors the resolver so the registry for whichever scope it
-  // picks has actually been fetched.
-  let configured: string;
-  if (publishConfig && 'scope' in publishConfig) {
-    // Manifest data: only '' means unset. A literal 'undefined' here is
-    // the scope '@undefined', which npm honours, so it is queried too.
-    const raw = publishConfig['scope'];
-    configured = typeof raw === 'string' ? raw : '';
-  } else {
-    configured = (npmConfigScope ?? '').trim();
-    // Mirrors normaliseScope: npm prefixes '@' to any scope it honours,
-    // so the bare literals it discards are discarded here too.
-    if (configured === 'undefined' || configured === 'null') {
-      configured = '';
-    }
-  }
-  if (configured !== '') {
-    scopes.add(configured.startsWith('@') ? configured : `@${configured}`);
-  }
-  const registries: Record<string, string | undefined> = {};
-  for (const scope of scopes) {
-    registries[`${scope}:registry`] = npmConfigGet(`${scope}:registry`, cwd);
-  }
-  return registries;
-}
-
 /** Write the outputs and say what was decided. */
 function emit(resolution: RegistryResolution, registryUrl: string): void {
   setOutput('registry', resolution.registry);
@@ -169,7 +113,7 @@ function emit(resolution: RegistryResolution, registryUrl: string): void {
   }
 }
 
-function main(): void {
+async function main(): Promise<void> {
   const projectDir = process.env.PROJECT_DIR ?? '';
   const registryUrl = process.env.REGISTRY_URL ?? '';
   const tarball = (process.env.TARBALL ?? '').trim();
@@ -188,22 +132,39 @@ function main(): void {
 
   const { packageName, publishConfig } = manifestFields(manifest);
   const cwd = projectDir || '.';
-  const npmConfigScope = npmConfigGet('scope', cwd);
+
+  // The npm on PATH is the one the publish step runs, so its own code
+  // decides. Found from the executable, not from 'npm root -g', whose
+  // answer is itself configuration.
+  const internals = loadNpmInternals();
+  if (!internals.loadConfig) {
+    error(
+      `npm ${internals.npmVersion} predates @npmcli/config, which this ` +
+        'action loads to resolve the publish registry. Use npm 7 or later.',
+    );
+    process.exit(1);
+  }
+  // Configured exactly as the publish step invokes npm: the same project
+  // directory, environment and configuration flags.
+  const config: LoadedConfig = await internals.loadConfig({
+    cwd,
+    flags: publishFlags(registryUrl),
+    env: process.env,
+  });
+  info(`Resolving the registry with npm ${internals.npmVersion}'s own configuration`);
 
   let resolution;
   try {
     resolution = resolveEffectiveRegistry({
       packageName,
       publishConfig,
-      npmConfigScopedRegistry: scopedRegistries(packageName, publishConfig, npmConfigScope, cwd),
-      npmConfigScope,
-      // Only meaningful when no --registry is passed; the resolver
-      // ignores it otherwise.
-      npmConfigRegistry: registryUrl.trim() === '' ? npmConfigGet('registry', cwd) : undefined,
       registryUrl,
+      config,
+      npmVersion: internals.npmVersion,
+      pickRegistry: internals.pickRegistry,
     });
   } catch (cause) {
-    if (cause instanceof RegistryError) {
+    if (cause instanceof RegistryError || cause instanceof NpmInternalsError) {
       error(cause.message);
       process.exit(1);
     }
@@ -214,23 +175,42 @@ function main(): void {
 }
 
 /**
- * Prove this bundle loads and its selection logic works, before anything
+ * Prove this bundle loads and its resolution logic runs, before anything
  * irreversible depends on it.
  *
- * This is now the *first* bundled program the action runs, so it inherits
- * the guard that used to sit in the publish step: a node_version too old
- * to load a bundle must fail with an actionable message rather than a raw
- * syntax or module error. Exercising the resolver rather than merely
- * printing a version means the check covers the artefact that will run.
+ * This is the *first* bundled program the action runs, so it carries the
+ * guard for a node_version too old to load a bundle: that must fail with
+ * an actionable message rather than a raw syntax or module error.
+ *
+ * Deliberately independent of npm. The action reports a failure here as
+ * the selected Node.js being unable to run its programs, so an npm problem
+ * must not surface here; main() reports those in their own terms. A stub
+ * configuration exercises the resolver end to end instead.
  */
 function selfTest(): void {
+  const flat: Record<string, unknown> = {
+    registry: 'https://other.invalid/',
+    '@scope:registry': 'https://example.invalid/',
+  };
+  const config: LoadedConfig = {
+    get: (key) => flat[key],
+    find: (key) => (key === 'registry' ? 'cli' : key in flat ? 'project' : null),
+    flat,
+    cliKeys: new Set(['registry']),
+    flatten: (source, target) => Object.assign(target, source),
+    validate: () => undefined,
+  };
+  const pickRegistry: PickRegistry = (spec, opts) => {
+    const scope = spec.startsWith('@') ? spec.slice(0, spec.indexOf('/')) : '';
+    return String((scope && opts[`${scope}:registry`]) || opts['registry']);
+  };
   const result = resolveEffectiveRegistry({
     packageName: '@scope/pkg',
-    publishConfig: { '@scope:registry': 'https://example.invalid/' },
-    npmConfigScopedRegistry: {},
-    npmConfigScope: undefined,
-    npmConfigRegistry: undefined,
+    publishConfig: undefined,
     registryUrl: 'https://other.invalid/',
+    config,
+    npmVersion: '11.0.0',
+    pickRegistry,
   });
   if (result.registry !== 'https://example.invalid/' || result.scope !== '@scope') {
     throw new Error('registry resolver self-test did not return the sample selection');
@@ -238,13 +218,15 @@ function selfTest(): void {
   info('registry resolver self-test passed');
 }
 
-try {
+async function run(): Promise<void> {
   if (process.argv.includes('--selftest')) {
     selfTest();
   } else {
-    main();
+    await main();
   }
-} catch (cause) {
+}
+
+run().catch((cause: unknown) => {
   error(cause instanceof Error ? cause.message : String(cause));
   process.exit(1);
-}
+});
