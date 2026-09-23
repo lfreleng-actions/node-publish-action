@@ -14,7 +14,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 
-import { loadNpmInternals } from '../../src/npm-internals.js';
+import { loadNpmInternals, manifestFields } from '../../src/npm-internals.js';
 import { publishFlags } from '../../src/publish-options.js';
 import { resolveEffectiveRegistry, type RegistryResolution } from '../../src/registry.js';
 import { isolatedEnv, makeProject, type Scenario } from './ground-truth.js';
@@ -22,6 +22,12 @@ import { isolatedEnv, makeProject, type Scenario } from './ground-truth.js';
 export async function resolveScenario(
   npmDir: string,
   scenario: Scenario,
+  /**
+   * Resolve as this npm release, overriding the loaded npm's own version.
+   * Only the release-gated publishConfig filtering reads it, so this tests
+   * behaviour either side of a boundary with whichever npm is on PATH.
+   */
+  asVersion?: string,
 ): Promise<RegistryResolution> {
   const internals = loadNpmInternals(npmDir);
   if (!internals.loadConfig) {
@@ -35,12 +41,19 @@ export async function resolveScenario(
       flags: publishFlags(scenario.registryUrl),
       env: { ...isolatedEnv(home), ...scenario.env },
     });
+    // Through npm's own reader, as the bin does, so manifest reading is
+    // under test too rather than bypassed with the scenario's raw fields.
+    const manifest = await internals.readManifest(
+      project.tarball === undefined ? { dir: project.dir } : { tarball: project.tarball },
+      config.flat,
+    );
+    const { packageName, publishConfig } = manifestFields(manifest);
     return resolveEffectiveRegistry({
-      packageName: scenario.packageName,
-      publishConfig: scenario.publishConfig,
+      packageName,
+      publishConfig,
       registryUrl: scenario.registryUrl,
       config,
-      npmVersion: internals.npmVersion,
+      npmVersion: asVersion ?? internals.npmVersion,
       pickRegistry: internals.pickRegistry,
     });
   } finally {

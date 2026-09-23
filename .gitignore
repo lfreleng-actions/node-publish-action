@@ -64,7 +64,7 @@ MANIFEST
 
 # Node
 node_modules/*
-# The npm-majors fixture installs its own tree for the loader tests.
-test/npm-majors/node_modules/
+# The npm-versions fixtures install their own trees for the loader tests.
+test/npm-versions/*/node_modules/
 coverage/
 .vitest/

@@ -10,8 +10,8 @@ path = [
   "package.json",
   "package-lock.json",
   "tsconfig.json",
-  "test/npm-majors/package.json",
-  "test/npm-majors/package-lock.json",
+  "test/npm-versions/*/package.json",
+  "test/npm-versions/*/package-lock.json",
 ]
 precedence = "aggregate"
 SPDX-FileCopyrightText = "2026 The Linux Foundation"

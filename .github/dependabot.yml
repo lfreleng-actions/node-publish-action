@@ -17,21 +17,29 @@ updates:
       default-days: 7
     open-pull-requests-limit: 15
 
-  # One npm per supported major, pinned by lockfile for the loader tests.
-  # Tracking each major's patch and minor releases is the point: a layout
-  # change in a new npm should fail test-npm-internals before it reaches a
-  # consumer. Major bumps are ignored because each alias stands for one
-  # major: moving npm-11 to 12 would drop 11's coverage rather than add
-  # 12's. A new major gets its own alias, added deliberately.
+  # One npm per supported major for the loader and parity tests, each in
+  # its own directory with a plain `npm` dependency. Not an alias:
+  # Dependabot skips aliased requirements outright, so an aliased fixture
+  # would never be updated. Tracking each major's patch and minor
+  # releases is the point, so that a layout change in a new npm fails
+  # test-npm-internals before it reaches a consumer. Major bumps are
+  # ignored, because each directory stands for one major; a new major
+  # gets its own directory.
+  #
+  # test/npm-versions/boundary-* are deliberately outside this glob. They
+  # pin the releases either side of the change where command-line flags
+  # began to beat publishConfig, and must never move;
+  # test/publish-options.test.ts enforces that.
   - package-ecosystem: "npm"
-    directory: "/test/npm-majors"
+    directories:
+      - "/test/npm-versions/npm-*"
     schedule:
       interval: "weekly"
     commit-message:
-      prefix: "Chore(npm-majors)"
+      prefix: "Chore(npm-versions)"
     cooldown:
       default-days: 7
     ignore:
-      - dependency-name: "*"
+      - dependency-name: "npm"
         update-types: ["version-update:semver-major"]
     open-pull-requests-limit: 6

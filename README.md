@@ -60,6 +60,17 @@ the pinned `actions/setup-node` action, without dependency caching.
 Real publishes need egress to the target registry; dry-run mode
 publishes nothing and writes no credential.
 
+The action needs **npm 8 or later**, the npm that `node_version`
+selects, and fails with a clear error on anything older. It resolves
+the publish registry with that npm's own configuration code, and npm 8
+is the oldest release whose behaviour the parity tests verify against
+`npm publish --dry-run`: npm 7's dry run never reports its
+destination, and npm 7 ignores a configured scope where later releases
+honour it. Every Node.js LTS release ships npm 8 or later; npm 7 came
+with Node 15 and the pre-LTS Node 16 releases and nothing else.
+Registry precedence also changed in **npm 10.5.2**; see
+[Effective Registry](#effective-registry) for what differs below it.
+
 ## Inputs
 
 <!-- markdownlint-disable MD013 -->
@@ -275,9 +286,8 @@ not always agree, and the action now resolves the difference instead
 of assuming it away.
 
 npm picks the registry with `pickRegistry`, which prefers a scoped
-setting and flattens a package's `publishConfig` over the resolved
-options — except for keys already supplied on the command line, which
-npm filters out. The search order is:
+setting, over its resolved options with the package's `publishConfig`
+flattened on top. The search order is:
 
 1. `publishConfig["@scope:registry"]`, for the package's own scope
 2. `@scope:registry` from npm configuration (`.npmrc`)
@@ -286,18 +296,33 @@ npm filters out. The search order is:
    redirects packages that are not themselves scoped
 4. `registry_url`
 
-`publishConfig.registry` is **not** in that list. npm filters it out
-whenever this action passes `--registry`, which leaves one case where
-it decides: a dry run with an empty `registry_url`, where the action
-passes no registry at all. Honouring it elsewhere would redirect a
-publish npm would have sent to the caller's registry.
+Which `publishConfig` keys npm applies **depends on the npm release**:
+
+| npm              | `publishConfig` keys set on the command line |
+| ---------------- | -------------------------------------------- |
+| before 10.5.2    | applied anyway, over the flag                |
+| 10.5.2 and later | skipped, so the flag wins                    |
+
+`publishConfig.registry` behaves differently either side of that
+line. From npm 10.5.2 it loses to the `--registry` this action
+passes, and decides when `registry_url` is empty. **Before 10.5.2 it
+wins even over `registry_url`**, and the action reports that
+destination.
+Node 16's npm, and older patch releases of Node 18 and 20, are below
+the line.
 
 A `publishConfig` key that is present but empty still counts: npm
 flattens it over the resolved options, so it masks any `.npmrc` value
 for the same key and the search moves past both.
 
-I checked each of these against npm 11.19.0 rather than reading the
-source alone.
+The action does not reimplement any of this. It loads the publishing
+npm's own configuration and `pickRegistry` in-process and asks them;
+the release-dependent key filtering is the one rule npm keeps inside
+its `publish` command rather than an importable module, so the action
+gates that on the npm version. A parity test runs `npm publish
+--dry-run` for 37 scenarios on npm 8, 9, 10.5.1, 10.5.2, 10.9, 11 and
+12, and requires the action to name the same destination as npm on
+each.
 
 With `tarball_path`, the manifest consulted is the one **inside the
 archive**, because that is the one npm reads: a tarball's scope and
@@ -313,16 +338,24 @@ confirmation where the name exists in both.
 
 The resolved value now drives the publish, the summary line and the
 verification alike — and the publish and verification commands **pin**
-it under *every* consulted scope as well as `--registry`. That turns a
-prediction into a guarantee: npm re-reads the manifest after
-`prepublishOnly` runs, so a script adding the scoped
+it under *every* consulted scope as well as `--registry`. npm re-reads
+the manifest after `prepublishOnly` runs, so a script adding the scoped
 `publishConfig` key could otherwise redirect the publish once
-resolution had finished. Since npm filters any key supplied on the
-command line, supplying those keys closes the window. A pin on the
-winning scope alone leaves a gap, because `pickRegistry` checks the
-package's own scope first and `npm view` does not load `publishConfig`
-at all. An unpinned key can still claim the publish or the
-verification.
+resolution had finished. Pinning the winning scope and nothing else
+would leave a gap, because `pickRegistry` checks the package's own
+scope first and `npm view` does not load `publishConfig` at all.
+
+The pins close that window **from npm 10.5.2 onward**. They work by
+being command-line keys, which npm skips in `publishConfig` from that
+release on. Before it, npm applies a `publishConfig` key over the
+flag, so a lifecycle script can still redirect the publish past a pin.
+Publish through `tarball_path` to rule it out on any npm: npm runs no
+lifecycle scripts for a tarball.
+
+The action refuses a scope whose pin would name the wrong key, rather
+than leave it unpinned. A line break would split the one-per-line
+scope list, and npm splits a command-line flag at its first `=`, so a
+pin for `@a=b` would name the key `@a`.
 
 The pinned value is the one resolved from the project's own files, so
 this fixes the destination rather than overriding the project's
@@ -361,10 +394,12 @@ never had: it arrives from the project's own files, and under trusted
 publishing npm sends a token to whatever registry wins. A non-`https`
 override fails the action rather than redirecting the publish.
 
-The configuration half of the answer comes from `npm config get`, so
-this reads npm's resolution rather than parsing `.npmrc` itself. The
-manifest supplies `publishConfig`, because `npm config` does not load
-it at all — which is why this redirection was invisible.
+The configuration half of the answer is npm's own: the action loads
+the publishing npm's `@npmcli/config` in-process, from that npm's own
+installation, rather than parsing `.npmrc` or decoding `npm config get`
+output. The manifest supplies `publishConfig`, because npm's
+configuration does not load it at all — which is why this redirection
+was invisible.
 
 ## Publishing a Pre-Packed Tarball
 

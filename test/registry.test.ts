@@ -22,7 +22,13 @@ import { describe, expect, it } from 'vitest';
 
 import { loadNpmInternals, NpmInternalsError } from '../src/npm-internals.js';
 import { publishFlags } from '../src/publish-options.js';
-import { RegistryError, resolveEffectiveRegistry, scopeOf } from '../src/registry.js';
+import {
+  assertSupportedNpm,
+  MINIMUM_NPM_MAJOR,
+  RegistryError,
+  resolveEffectiveRegistry,
+  scopeOf,
+} from '../src/registry.js';
 import { isolatedEnv, makeProject, type Scenario } from './support/ground-truth.js';
 import { resolveScenario } from './support/resolve.js';
 
@@ -82,6 +88,30 @@ describe('scopeOf', () => {
     // any of them as scoped would look up a nonsense config key and
     // silently miss a real override.
     expect(scopeOf(name)).toBeNull();
+  });
+});
+
+describe('assertSupportedNpm', () => {
+  it.each(['8.0.0', '8.19.4', '10.5.1', '11.20.0'])('accepts npm %s', (version) => {
+    expect(() => assertSupportedNpm(version)).not.toThrow();
+  });
+
+  it.each(['7.24.2', '6.14.18', 'not-a-version', ''])('refuses npm %o', (version) => {
+    expect(() => assertSupportedNpm(version)).toThrow(NpmInternalsError);
+  });
+
+  it('names the floor and the remedy', () => {
+    expect(() => assertSupportedNpm('7.24.2')).toThrow(
+      new RegExp(`older than npm ${MINIMUM_NPM_MAJOR}.*raise node_version`),
+    );
+  });
+
+  it('is enforced by the resolver itself, not only available to it', async () => {
+    // Any caller of resolveEffectiveRegistry gets the floor, so no entry
+    // point can report unverified behaviour by forgetting to check.
+    await expect(
+      resolveScenario(internals.npmDir, { name: 'x', packageName: 'p', registryUrl: INPUT }, '7.24.2'),
+    ).rejects.toThrow(/older than npm 8/);
   });
 });
 
@@ -291,8 +321,70 @@ describe('resolveEffectiveRegistry', () => {
       await expect(resolve({ publishConfig: { '@onap:registry': ['x'] } })).rejects.toThrow(/array/);
     });
 
+    it.each(['registry', 'scope'])(
+      'checks a non-string publishConfig.%s before npm flattens it',
+      (key) => {
+        // A stand-in for an npm whose flatten dereferences the value as a
+        // string. The resolver must report its own error, not npm's
+        // TypeError, which says nothing about the manifest.
+        const flatten = (source: Readonly<Record<string, unknown>>, target: Record<string, unknown>) => {
+          for (const [k, v] of Object.entries(source)) {
+            if (typeof v !== 'string') throw new TypeError('value.endsWith is not a function');
+            target[k] = v;
+          }
+        };
+        const config = {
+          get: () => undefined,
+          find: () => null,
+          flat: {},
+          cliKeys: new Set<string>(),
+          flatten,
+          validate: () => undefined,
+        };
+        expect(() =>
+          resolveEffectiveRegistry({
+            packageName: 'ui-common',
+            publishConfig: { [key]: 42 },
+            registryUrl: '',
+            config,
+            npmVersion: internals.npmVersion,
+            pickRegistry: () => 'https://registry.npmjs.org/',
+          }),
+        ).toThrow(RegistryError);
+      },
+    );
+
     it('refuses a non-string publishConfig.scope before npm dereferences it', async () => {
-      await expect(resolve({ publishConfig: { scope: 42 } })).rejects.toThrow(/\(scope\) is a number/);
+      const message = await messageOf(resolve({ publishConfig: { scope: 42 } }));
+      expect(message).toMatch(/\(scope\) is a number, not a scope name/);
+      expect(message).not.toMatch(/registry URL/);
+    });
+
+    it.each([
+      ['publishConfig.scope', { publishConfig: { scope: '@a\nb' } }, /publishConfig \(scope\)/],
+      ['npm_config_scope', { env: { npm_config_scope: '@a\rb' } }, /npm config scope/],
+    ] as const)(
+      'refuses a %s containing a line break, which would split the pinned list',
+      async (_label, overrides, where) => {
+        // Scopes are emitted one per line and pinned line by line; a
+        // line break would pin keys npm never consults.
+        const message = await messageOf(resolve({ packageName: 'ui-common', ...overrides }));
+        expect(message).toMatch(where);
+        expect(message).toMatch(/control character \(U\+000[AD]\)/);
+      },
+    );
+
+    it("refuses a scope containing '=', which a command-line pin cannot name", async () => {
+      // npm splits a flag at its first '=': --@a=b:registry=URL is read
+      // as the key '@a', leaving '@a=b:registry' unpinned. An .npmrc
+      // cannot carry the key, but publishConfig can.
+      const message = await messageOf(
+        resolve({
+          packageName: 'ui-common',
+          publishConfig: { scope: '@a=b', '@a=b:registry': 'https://eq.example/' },
+        }),
+      );
+      expect(message).toMatch(/publishConfig \(scope\) contains '='/);
     });
 
     it('masks with a falsey non-string, then falls through', async () => {
@@ -473,6 +565,31 @@ describe('resolveEffectiveRegistry', () => {
       await expect(resolve({ scopedRegistry: 'http://registry.example.org/' })).rejects.toThrow(
         /http:\/\/registry\.example\.org\//,
       );
+    });
+  });
+
+  describe('crediting registry_url', () => {
+    // registry_url equal to npm's built-in default, so that a manifest-
+    // masked flag and npm's fall-through produce the same URL. Only the
+    // source tells them apart.
+    const DEFAULT = 'https://registry.npmjs.org/';
+    const masked: Scenario = {
+      name: 'masked',
+      packageName: 'ui-common',
+      publishConfig: { registry: '' },
+      registryUrl: DEFAULT,
+    };
+
+    it('withholds the credit when an empty publishConfig.registry masked the flag', async () => {
+      // Before npm 10.5.2 the manifest key is applied over --registry, so
+      // npm used its default: the same URL, but not the caller's doing.
+      const result = await resolveScenario(internals.npmDir, masked, '10.5.1');
+      expect(result).toMatchObject({ registry: DEFAULT, source: 'npm-config-registry' });
+    });
+
+    it('gives the credit once npm filters the key, from 10.5.2', async () => {
+      const result = await resolveScenario(internals.npmDir, masked, '10.5.2');
+      expect(result).toMatchObject({ registry: DEFAULT, source: 'input' });
     });
   });
 

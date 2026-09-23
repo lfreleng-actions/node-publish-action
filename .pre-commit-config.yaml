@@ -106,7 +106,7 @@ repos:
       - id: codespell
         # Lockfiles are generated and hold base64 integrity hashes, whose
         # fragments read as misspellings; they carry no prose to check.
-        # Unanchored, so the test/npm-majors fixture is covered too.
+        # Unanchored, so the test/npm-versions fixtures are covered too.
         exclude: "(^|/)package-lock\\.json$"
 
   # Requires a mirror, primary repo lacks .pre-commit-hooks.yaml

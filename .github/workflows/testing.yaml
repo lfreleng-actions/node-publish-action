@@ -1096,22 +1096,20 @@ jobs:
           # Install dependencies
           npm ci --no-audit --no-fund
 
-      - name: "Install each npm major side by side"
+      - name: "Install each npm side by side"
         shell: bash
         run: |
-          # Install each npm major side by side
-          # From a committed lockfile, so every run exercises the same npm
-          # builds: resolving npm@6 afresh would test whatever shipped
-          # last. Aliases (npm-6 ... npm-11) let the majors coexist, and
-          # none is installed globally, so the npm on PATH stays the
-          # toolchain's. npm 6 predates @npmcli/config and covers registry
-          # selection alone; the suite gates the rest by major.
-          npm ci --prefix test/npm-majors --no-audit --no-fund \
-            --ignore-scripts
-          base="${GITHUB_WORKSPACE}/test/npm-majors/node_modules"
+          # Install each npm side by side
+          # One directory per npm, each from its own committed lockfile, so
+          # every run exercises the same npm builds: resolving npm@6 afresh
+          # would test whatever shipped last. None is installed globally,
+          # so the npm on PATH stays the toolchain's. npm 6 predates
+          # @npmcli/config and covers registry selection alone; the suite
+          # gates the rest by version.
           dirs=()
-          for major in 6 7 8 9 10.5.1 10.5.2 10 11; do
-            dirs+=("${base}/npm-${major}")
+          for fixture in test/npm-versions/*/; do
+            npm ci --prefix "$fixture" --no-audit --no-fund --ignore-scripts
+            dirs+=("${GITHUB_WORKSPACE}/${fixture}node_modules/npm")
           done
           IFS=':'
           echo "NPM_INTERNALS_DIRS=${dirs[*]}" >> "$GITHUB_ENV"
