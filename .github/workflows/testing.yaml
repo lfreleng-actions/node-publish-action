@@ -70,11 +70,6 @@ jobs:
           allowed-endpoints: >
             ${{ env.CONNECTION_ALLOW_LIST }}
 
-      - name: "Checkout repository"
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
       # The real fixture has no engines field and no .nvmrc, so the
       # matrix passes an explicit Node.js version for both fixtures
       - name: "Checkout test project: ${{ matrix.repository }}"
@@ -87,7 +82,7 @@ jobs:
 
       - name: "Running local action: dry-run publish"
         id: publish
-        uses: ./
+        uses: $/
         with:
           path_prefix: test-project
           node_version: '22'
@@ -175,11 +170,6 @@ jobs:
           allowed-endpoints: >
             ${{ env.CONNECTION_ALLOW_LIST }}
 
-      - name: "Checkout repository"
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
       # A minimal project isolates each negative test on its target
       # input; the placeholder password below is a test literal, not
       # a real credential
@@ -195,7 +185,7 @@ jobs:
       - name: "Running local action with shell metacharacters"
         id: bad-version
         continue-on-error: true
-        uses: ./
+        uses: $/
         with:
           path_prefix: fake-project
           publish_version: '1.0.0;rm -rf /'
@@ -204,7 +194,7 @@ jobs:
       - name: "Running local action with newline injection"
         id: newline-version
         continue-on-error: true
-        uses: ./
+        uses: $/
         with:
           path_prefix: fake-project
           publish_version: |
@@ -215,7 +205,7 @@ jobs:
       - name: "Running local action with invalid registry URL"
         id: bad-registry
         continue-on-error: true
-        uses: ./
+        uses: $/
         with:
           path_prefix: fake-project
           publish_version: '1.0.0'
@@ -225,7 +215,7 @@ jobs:
       - name: "Running local action without credentials"
         id: no-credentials
         continue-on-error: true
-        uses: ./
+        uses: $/
         with:
           path_prefix: fake-project
           publish_version: '1.0.0'
@@ -234,7 +224,7 @@ jobs:
       - name: "Running local action with workspace-escaping path"
         id: escape-path
         continue-on-error: true
-        uses: ./
+        uses: $/
         with:
           path_prefix: /etc
           publish_version: '1.0.0'
@@ -243,7 +233,7 @@ jobs:
       - name: "Running local action with invalid tag"
         id: bad-tag
         continue-on-error: true
-        uses: ./
+        uses: $/
         with:
           path_prefix: fake-project
           publish_version: '1.0.0'
@@ -253,7 +243,7 @@ jobs:
       - name: "Running local action with invalid access"
         id: bad-access
         continue-on-error: true
-        uses: ./
+        uses: $/
         with:
           path_prefix: fake-project
           publish_version: '1.0.0'
@@ -329,11 +319,6 @@ jobs:
           allowed-endpoints: >
             ${{ env.CONNECTION_ALLOW_LIST }}
 
-      - name: "Checkout repository"
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
       # Each hook writes a marker file. Their absence after the run
       # proves --ignore-scripts suppressed them, rather than the hook
       # merely producing no visible output.
@@ -357,7 +342,7 @@ jobs:
 
       - name: "Run local action against the hook fixture"
         id: hooks
-        uses: ./
+        uses: $/
         with:
           path_prefix: hook-project
           publish_version: '2.3.4'
@@ -582,11 +567,6 @@ jobs:
           allowed-endpoints: >
             ${{ env.CONNECTION_ALLOW_LIST }}
 
-      - name: "Checkout repository"
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
       - name: "Create a workspace fixture with two children"
         shell: bash
         run: |
@@ -616,7 +596,7 @@ jobs:
 
       - name: "Dry-run publish from the workspace root"
         id: ws-publish
-        uses: ./
+        uses: $/
         with:
           path_prefix: ws-project
           publish_version: '9.9.9'
@@ -639,7 +619,7 @@ jobs:
         continue-on-error: true
         env:
           NPM_CONFIG_WORKSPACE: 'packages/a'
-        uses: ./
+        uses: $/
         with:
           path_prefix: ws-project
           publish_version: '5.5.5'
@@ -768,7 +748,7 @@ jobs:
       - name: "Token plus password [expected failure]"
         id: token-and-password
         continue-on-error: true
-        uses: ./
+        uses: $/
         with:
           path_prefix: auth-project
           publish_version: '1.0.0'
@@ -789,7 +769,7 @@ jobs:
       - name: "Token plus load_credential [expected failure]"
         id: token-and-load
         continue-on-error: true
-        uses: ./
+        uses: $/
         with:
           path_prefix: auth-project
           publish_version: '1.0.0'
@@ -813,7 +793,7 @@ jobs:
       - name: "Token auth writes an authenticated .npmrc"
         id: token-npmrc
         continue-on-error: true
-        uses: ./
+        uses: $/
         with:
           path_prefix: token-project
           publish_version: '1.0.0'
@@ -1145,11 +1125,6 @@ jobs:
           allowed-endpoints: >
             ${{ env.CONNECTION_ALLOW_LIST }}
 
-      - name: "Checkout repository"
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
       - name: "Create a fixture whose hooks write to stdout"
         shell: bash
         run: |
@@ -1183,7 +1158,7 @@ jobs:
 
       - name: "Publish with noisy hooks"
         id: noisy
-        uses: ./
+        uses: $/
         with:
           path_prefix: noisy-project
           publish_version: '4.4.4'
@@ -1273,7 +1248,7 @@ jobs:
 
       - name: "Running local action: publish the packed tarball"
         id: publish
-        uses: ./
+        uses: $/
         with:
           path_prefix: project
           tarball_path: packed-package-3.2.1.tgz
@@ -1928,7 +1903,7 @@ jobs:
 
       - name: "Running local action: scoped override, dry run"
         id: scoped
-        uses: ./
+        uses: $/
         with:
           path_prefix: scoped-fixture
           publish_version: '1.0.0'
@@ -1975,7 +1950,7 @@ jobs:
       - name: "Running local action: http override must fail"
         id: refused
         continue-on-error: true
-        uses: ./
+        uses: $/
         with:
           path_prefix: refused-fixture
           publish_version: '1.0.0'
