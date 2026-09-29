@@ -84,6 +84,7 @@ function assertTextUsable(registry: string, where: string): void {
   // project-controlled value may carry: NUL truncates, ESC begins a
   // terminal escape sequence, and the rest are meaningless in a URL. The
   // whole C0 range and DEL are refused rather than an enumerated few.
+  // eslint-disable-next-line no-control-regex -- matching them is the point
   const control = /[\u0000-\u001f\u007f]/.exec(registry);
   if (control) {
     // The offending character is named by code point, and the value is

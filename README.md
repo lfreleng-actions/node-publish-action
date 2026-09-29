@@ -467,6 +467,12 @@ independent of the compiler version; `tsc --noEmit` handles type
 checking. The build output is deterministic, which the `check-dist`
 job depends on.
 
+TypeScript 7 ships no compiler API, which typescript-eslint needs, so
+the two versions run side by side as the TypeScript 7 release notes
+describe. `@typescript/native` aliases TypeScript 7 and provides
+`tsc`; `typescript` aliases `@typescript/typescript6` for ESLint. Keep
+that pairing when upgrading either one.
+
 Two different Node.js floors apply, and they are not the same number:
 
 - **The development toolchain** needs the version in `engines`
