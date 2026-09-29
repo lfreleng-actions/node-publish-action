@@ -476,7 +476,8 @@ that pairing when upgrading either one.
 Two different Node.js floors apply, and they are not the same number:
 
 - **The development toolchain** needs the version in `engines`
-  (`^20.19.0 || >=22.12.0`), which vitest and vite require. It governs
+  (`^20.19.0 || ^22.13.0 || >=24`), the range ESLint, vitest and vite
+  all support. It governs
   `npm ci` and the commands above
 - **The bundle** targets `node18`, because it runs on whatever
   `node_version` selected for the publish rather than on the toolchain.
