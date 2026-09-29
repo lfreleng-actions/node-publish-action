@@ -28,7 +28,7 @@ repos:
         name: frozen revs name a release
         language: pygrep
         # yamllint disable-line rule:line-length
-        entry: '^\s*rev:\s*\S+\s+#\s*frozen:(?!\s+v?[0-9]+(\.[0-9]+)*(-[0-9]+)?\s*$)'
+        entry: '^[ \t]*rev:[ \t]*\S+[ \t]+#[ \t]*frozen:(?![ \t]+v?[0-9]+(\.[0-9]+)*(-[0-9]+)?[ \t]*$)'
         files: '^\.pre-commit-config\.yaml$'
 
   - repo: https://github.com/pre-commit/pre-commit-hooks
