@@ -16,3 +16,22 @@ updates:
     cooldown:
       default-days: 7
     open-pull-requests-limit: 15
+
+  # One npm per supported major, pinned by lockfile for the loader tests.
+  # Tracking each major's patch and minor releases is the point: a layout
+  # change in a new npm should fail test-npm-internals before it reaches a
+  # consumer. Major bumps are ignored because each alias stands for one
+  # major: moving npm-11 to 12 would drop 11's coverage rather than add
+  # 12's. A new major gets its own alias, added deliberately.
+  - package-ecosystem: "npm"
+    directory: "/test/npm-majors"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "Chore(npm-majors)"
+    cooldown:
+      default-days: 7
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
+    open-pull-requests-limit: 6

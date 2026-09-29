@@ -1,0 +1,15 @@
+{
+  "name": "npm-majors-fixture",
+  "version": "0.0.0",
+  "private": true,
+  "description": "One npm per supported major, for test/npm-internals.real.test.ts. Aliased so they install side by side; locked so the matrix is reproducible.",
+  "license": "Apache-2.0",
+  "dependencies": {
+    "npm-6": "npm:npm@6.14.18",
+    "npm-7": "npm:npm@7.24.2",
+    "npm-8": "npm:npm@8.19.4",
+    "npm-9": "npm:npm@9.9.4",
+    "npm-10": "npm:npm@10.9.9",
+    "npm-11": "npm:npm@11.20.0"
+  }
+}
