@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 The Linux Foundation
 
-import { readFileSync } from 'node:fs';
-import path from 'node:path';
-
 import { describe, expect, it } from 'vitest';
 
 import type { LoadedConfig } from '../src/npm-internals.js';
@@ -13,6 +10,7 @@ import {
   publishFlags,
   publishOptions,
 } from '../src/publish-options.js';
+import { lockedNpm } from './support/npm-versions.js';
 
 /** A configuration whose flatten simply copies keys, as npm's does for these. */
 function config(flat: Record<string, unknown>, cliKeys: string[] = []): LoadedConfig {
@@ -51,13 +49,6 @@ describe('the boundary fixture', () => {
   // CLI_FILTER_SINCE. They sit outside Dependabot's scope so nothing
   // moves them; this pins them to the constant, so an edit to either
   // fails here rather than silently dropping one side of the boundary.
-  const lockedNpm = (dir: string): string => {
-    const lock = JSON.parse(
-      readFileSync(path.join('test', 'npm-versions', dir, 'package-lock.json'), 'utf8'),
-    ) as { packages: Record<string, { version?: string }> };
-    return lock.packages['node_modules/npm']?.version ?? '';
-  };
-
   it('locks the release just below the boundary', () => {
     const version = lockedNpm('boundary-10.5.1');
     expect(version).toBe('10.5.1');

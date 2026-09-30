@@ -24,7 +24,10 @@ updates:
   # releases is the point, so that a layout change in a new npm fails
   # test-npm-internals before it reaches a consumer. Major bumps are
   # ignored, because each directory stands for one major; a new major
-  # gets its own directory.
+  # gets its own directory. Security updates disregard that rule, and
+  # will move a fixture to a later major to clear an advisory in a
+  # dependency bundled with npm; test/npm-versions.test.ts fails any
+  # such change.
   #
   # test/npm-versions/boundary-* are deliberately outside this glob. They
   # pin the releases either side of the change where command-line flags
