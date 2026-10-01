@@ -170,6 +170,7 @@ function optionScope(opts: Readonly<Record<string, unknown>>): string | null {
  * point where it would corrupt the line reporting it.
  */
 function assertScopeText(scope: string, where: string): void {
+  // eslint-disable-next-line no-control-regex -- matching them is the point
   const control = /[\u0000-\u001f\u007f]/.exec(scope);
   if (control) {
     const code = (control[0].codePointAt(0) ?? 0).toString(16).toUpperCase().padStart(4, '0');
