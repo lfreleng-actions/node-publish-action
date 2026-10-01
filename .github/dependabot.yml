@@ -24,15 +24,19 @@ updates:
   # releases is the point, so that a layout change in a new npm fails
   # test-npm-internals before it reaches a consumer. Major bumps are
   # ignored, because each directory stands for one major; a new major
-  # gets its own directory. Security updates disregard that rule, and
-  # will move a fixture to a later major to clear an advisory in a
-  # dependency bundled with npm; test/npm-versions.test.ts fails any
-  # such change.
+  # gets its own directory.
   #
-  # test/npm-versions/boundary-* are deliberately outside this glob. They
-  # pin the releases either side of the change where command-line flags
-  # began to beat publishConfig, and must never move;
-  # test/publish-options.test.ts enforces that.
+  # None of this governs security updates. They disregard the ignore
+  # rule, and reach directories outside this glob. A repository
+  # Dependabot auto-triage rule keeps them off every fixture instead,
+  # and the tests fail any change that moves one; see "The npm test
+  # fixtures and Dependabot" in README.md. The rule names each lockfile,
+  # so a fixture directory added or renamed must be added to it.
+  #
+  # test/npm-versions/boundary-* are outside this glob, so they get no
+  # version updates. They pin the releases either side of the change
+  # where command-line flags began to beat publishConfig, and must never
+  # move; test/publish-options.test.ts enforces that.
   - package-ecosystem: "npm"
     directories:
       - "/test/npm-versions/npm-*"

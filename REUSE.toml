@@ -35,3 +35,11 @@ path = ["test/fixtures/**"]
 precedence = "aggregate"
 SPDX-FileCopyrightText = "2026 The Linux Foundation"
 SPDX-License-Identifier = "Apache-2.0"
+
+# Screenshots embedded in the documentation. Image formats admit no
+# comment syntax.
+[[annotations]]
+path = ["images/**"]
+precedence = "aggregate"
+SPDX-FileCopyrightText = "2026 The Linux Foundation"
+SPDX-License-Identifier = "Apache-2.0"

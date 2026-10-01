@@ -534,5 +534,44 @@ protocol this action needs — outputs, workflow commands and their
 escaping — with unit tests, which keeps the committed bundle small
 enough to review.
 
+### The npm test fixtures and Dependabot
+
+`test/npm-versions/` holds one npm per supported major (`npm-6` to
+`npm-12`), plus the releases either side of the 10.5.2 `publishConfig`
+change (`boundary-10.5.1`, `boundary-10.5.2`). Each directory pins one
+npm release in a `package.json` and lockfile, and CI installs them
+side by side for the loader and parity tests. They are test subjects,
+not dependencies of the action.
+
+GitHub reads each lockfile as a real manifest, though. The packages
+npm bundles raise Dependabot alerts, and Dependabot security updates
+try to fix them. For npm, a security update moves the parent package
+when nothing else clears the advisory, and for a package npm bundles
+that parent is npm itself: security updates proposed moving five
+fixtures to npm 12. `.github/dependabot.yml` cannot stop this. Its
+ignore rules apply to version updates alone, and directories it leaves
+out still receive security updates.
+
+Two safeguards keep each fixture in place:
+
+- A repository **Dependabot auto-triage rule** dismisses every alert
+  on the fixture lockfiles, indefinitely. Dependabot raises security
+  updates for open alerts alone, so it raises none for the fixtures.
+  Version updates within each major still arrive, as
+  `.github/dependabot.yml` configures them
+- Tests fail any change that moves a fixture.
+  `test/npm-versions.test.ts` pins each `npm-<N>` to major N, and
+  `test/publish-options.test.ts` pins the boundary fixtures to their
+  exact releases
+
+The rule lives in the repository settings, under **Settings →
+Advanced Security → Dependabot rules**, not in the repository itself.
+Its manifest filter takes no wildcards, so it names each lockfile.
+**Adding or renaming a fixture directory means editing the rule.**
+
+![The repository Dependabot rule for the npm test fixtures][rule]
+
+[rule]: images/dependabot_tests_exclusion.png
+
 [pre-commit.ci results page]: https://results.pre-commit.ci/latest/github/lfreleng-actions/node-publish-action/main
 [pre-commit.ci status badge]: https://results.pre-commit.ci/badge/github/lfreleng-actions/node-publish-action/main.svg
