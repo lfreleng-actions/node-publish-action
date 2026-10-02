@@ -4,6 +4,6 @@
   "private": true,
   "license": "Apache-2.0",
   "dependencies": {
-    "npm": "12.2.0"
+    "npm": "10.9.9"
   }
 }
