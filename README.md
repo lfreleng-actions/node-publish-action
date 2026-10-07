@@ -552,7 +552,7 @@ fixtures to npm 12. `.github/dependabot.yml` cannot stop this. Its
 ignore rules apply to version updates alone, and directories it leaves
 out still receive security updates.
 
-Two safeguards keep each fixture in place:
+Three safeguards keep each fixture in place:
 
 - A repository **Dependabot auto-triage rule** dismisses every alert
   on the fixture lockfiles, indefinitely. Dependabot raises security
@@ -563,11 +563,41 @@ Two safeguards keep each fixture in place:
   `test/npm-versions.test.ts` pins each `npm-<N>` to major N, and
   `test/publish-options.test.ts` pins the boundary fixtures to their
   exact releases
+- Each fixture directory carries an `osv-scanner.toml` that skips
+  every package in it. The OpenSSF Scorecard *Vulnerabilities* check
+  scans with OSV-Scanner, which reads neither Dependabot's dismissals
+  nor its rules, and would otherwise report each advisory against the
+  pinned npm releases. The file covers its own directory alone, and
+  `test/npm-versions.test.ts` requires one in every fixture
 
 The rule lives in the repository settings, under **Settings →
 Advanced Security → Dependabot rules**, not in the repository itself.
 Its manifest filter takes no wildcards, so it names each lockfile.
-**Adding or renaming a fixture directory means editing the rule.**
+**Give each lockfile its own `manifest:` term.** The rule holds these
+nine, entered on one line and separated by spaces:
+
+```text
+manifest:test/npm-versions/npm-6/package-lock.json
+manifest:test/npm-versions/npm-7/package-lock.json
+manifest:test/npm-versions/npm-8/package-lock.json
+manifest:test/npm-versions/npm-9/package-lock.json
+manifest:test/npm-versions/npm-10/package-lock.json
+manifest:test/npm-versions/npm-11/package-lock.json
+manifest:test/npm-versions/npm-12/package-lock.json
+manifest:test/npm-versions/boundary-10.5.1/package-lock.json
+manifest:test/npm-versions/boundary-10.5.2/package-lock.json
+```
+
+The form also accepts a comma-separated list, but stores it as one
+value that matches no alert, and the settings page shows both forms
+the same way. The organisation audit log records what the form
+stored: a `vulnerability_alert_rule.create` or `.update` event lists
+the `manifest` condition, which must hold one entry per lockfile.
+
+**Adding or renaming a fixture directory means three changes**: add
+its lockfile to the rule, give it an `osv-scanner.toml`, and, for an
+`npm-<N>` directory, check that it falls inside the `directories`
+glob in `.github/dependabot.yml`.
 
 ![The repository Dependabot rule for the npm test fixtures][rule]
 
