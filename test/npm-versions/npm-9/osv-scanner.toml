@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2026 The Linux Foundation
+
+# This fixture pins an npm release on purpose, for the loader and parity
+# tests; the vulnerable packages ship inside that npm. See "The npm test
+# fixtures and Dependabot" in README.md.
+[[PackageOverrides]]
+ignore = true
+reason = "Test fixture: pins an npm release on purpose; see README.md"

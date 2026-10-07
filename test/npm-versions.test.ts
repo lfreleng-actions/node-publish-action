@@ -102,7 +102,7 @@ describe('isSkipAll', () => {
 });
 
 describe('every fixture', () => {
-  it.fails.each(everyFixture)('%s tells OSV-Scanner to skip its packages', (dir) => {
+  it.each(everyFixture)('%s tells OSV-Scanner to skip its packages', (dir) => {
     const text = readFileSync(path.join(NPM_VERSIONS_DIR, dir, 'osv-scanner.toml'), 'utf8');
     expect(isSkipAll(text)).toBe(true);
   });
