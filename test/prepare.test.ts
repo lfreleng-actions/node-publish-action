@@ -18,6 +18,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { InputError } from '../src/inputs.js';
 import { loadNpmInternals, NpmInternalsError } from '../src/npm-internals.js';
 import { prepare } from '../src/prepare.js';
+import { readState, STAGED_NAME, STATE_NAME } from '../src/state.js';
 import { isolatedEnv } from './support/ground-truth.js';
 
 let root: string;
@@ -78,7 +79,19 @@ describe('prepare: packing the project directory', () => {
     expect(result.tarball).toBe('');
     expect(result.resolution.registry).toBe('https://registry.example.invalid/');
     expect(result.resolution.source).toBe('input');
-    expect(readdirSync(runnerTemp)).toEqual([]);
+    // The state the publish step reads, and nothing else, in a private
+    // work directory.
+    const state = readState(result.statePath, runnerTemp);
+    expect(state).toMatchObject({
+      projectDir: path.join(workspace, 'project'),
+      tarball: '',
+      publishVersion: '3.2.1',
+      dryRun: true,
+      tag: 'latest',
+      registry: 'https://registry.example.invalid/',
+      scopes: [],
+    });
+    expect(readdirSync(path.dirname(result.statePath))).toEqual([STATE_NAME]);
   });
 
   it('carries the input notices through', async () => {
@@ -124,8 +137,9 @@ describe('prepare: publishing a pre-packed tarball', () => {
   it('stages the archive and checks its version', async () => {
     const tarball = pack('ok.tgz', '{"name":"packed-package","version":"3.2.1"}');
     const result = await prepare(env({ INPUT_TARBALL_PATH: tarball }));
-    expect(path.dirname(path.dirname(result.tarball))).toBe(runnerTemp);
+    expect(result.tarball).toBe(path.join(path.dirname(result.statePath), STAGED_NAME));
     expect(existsSync(result.tarball)).toBe(true);
+    expect(readState(result.statePath, runnerTemp).tarball).toBe(result.tarball);
   });
 
   // The version compared is the one npm sends, normalised as npm
@@ -160,7 +174,7 @@ describe('prepare: publishing a pre-packed tarball', () => {
     }, '3.2.1', 'cannot read package.json from the tarball'],
     ['manifest is not JSON', () => pack('badjson.tgz', '{ not json'), '3.2.1', 'not valid JSON'],
     ['manifest has no version', () => pack('noversion.tgz', '{"name":"no-version"}'), '3.2.1', 'declares no version'],
-  ])('refuses %s, and removes the staged copy', async (_label, make, version, message) => {
+  ])('refuses %s, and removes the work directory', async (_label, make, version, message) => {
     const tarball = make();
     const failure = prepare(env({ INPUT_TARBALL_PATH: tarball, INPUT_PUBLISH_VERSION: version }));
     await expect(failure).rejects.toThrow(InputError);
@@ -182,7 +196,7 @@ describe('prepare: publishing a pre-packed tarball', () => {
     expect(readdirSync(runnerTemp)).toEqual([]);
   });
 
-  it('refuses a path rejection before staging anything', async () => {
+  it('refuses a path rejection before making a work directory', async () => {
     await expect(prepare(env({ INPUT_TARBALL_PATH: 'nope.tgz' }))).rejects.toThrow(
       'cannot resolve tarball_path',
     );

@@ -17,17 +17,16 @@ import {
   constants,
   fstatSync,
   lstatSync,
-  mkdtempSync,
   openSync,
   readSync,
   realpathSync,
-  rmSync,
   statSync,
   writeSync,
 } from 'node:fs';
 import path from 'node:path';
 
 import { InputError } from './inputs.js';
+import { STAGED_NAME } from './state.js';
 
 /** The runner directories the boundary checks depend on, resolved. */
 export interface RunnerDirs {
@@ -172,12 +171,6 @@ export function resolveTarball(tarballPath: string, dirs: RunnerDirs): string {
   return resolved;
 }
 
-/** The prefix of a staging directory, which the cleanup step matches on. */
-export const STAGING_PREFIX = 'npmstage.';
-
-/** The staged archive's name inside its staging directory. */
-export const STAGED_NAME = 'package.tgz';
-
 /**
  * How the source archive is opened: read-only, not through a final
  * symlink, and without waiting on a FIFO.
@@ -220,7 +213,7 @@ export function isSameRegularFile(opened: BigIntStats, named: BigIntStats): bool
 }
 
 /**
- * Copy the archive into RUNNER_TEMP before anything reads it.
+ * Copy the archive into the work directory before anything reads it.
  *
  * Every later check opens the archive, and so does npm publish. On the
  * workspace path each open is a fresh chance to substitute the file, and no
@@ -239,49 +232,64 @@ export function isSameRegularFile(opened: BigIntStats, named: BigIntStats): bool
  */
 export function stageTarball(
   resolved: string,
-  runnerTemp: string,
+  workDir: string,
   openFlags: number = STAGE_OPEN_FLAGS,
 ): string {
-  const dir = mkdtempSync(path.join(runnerTemp, STAGING_PREFIX));
+  const staged = path.join(workDir, STAGED_NAME);
+  let fd: number;
   try {
-    const staged = path.join(dir, STAGED_NAME);
-    let fd: number;
-    try {
-      fd = openSync(resolved, openFlags);
-    } catch (cause) {
-      const code = (cause as NodeJS.ErrnoException).code;
-      throw new InputError(
-        code === 'ELOOP' ? REPLACED : `cannot stage the tarball (${code ?? 'unknown error'})`,
-      );
-    }
-    try {
-      const opened = fstatSync(fd, { bigint: true });
-      let named;
-      try {
-        named = lstatSync(resolved, { bigint: true });
-      } catch {
-        throw new InputError(REPLACED);
-      }
-      if (!isSameRegularFile(opened, named)) {
-        throw new InputError(REPLACED);
-      }
-      const out = openSync(staged, 'wx', 0o600);
-      try {
-        copyDescriptor(fd, out);
-      } finally {
-        closeSync(out);
-      }
-    } finally {
-      closeSync(fd);
-    }
-    return staged;
+    fd = openSync(resolved, openFlags);
   } catch (cause) {
-    rmSync(dir, { recursive: true, force: true });
-    throw cause;
+    const code = (cause as NodeJS.ErrnoException).code;
+    throw new InputError(
+      code === 'ELOOP' ? REPLACED : `cannot stage the tarball (${code ?? 'unknown error'})`,
+    );
   }
+  try {
+    const opened = fstatSync(fd, { bigint: true });
+    let named;
+    try {
+      named = lstatSync(resolved, { bigint: true });
+    } catch {
+      throw new InputError(REPLACED);
+    }
+    if (!isSameRegularFile(opened, named)) {
+      throw new InputError(REPLACED);
+    }
+    const out = openSync(staged, 'wx', 0o600);
+    try {
+      copyDescriptor(fd, out);
+    } finally {
+      closeSync(out);
+    }
+  } finally {
+    closeSync(fd);
+  }
+  return staged;
 }
 
-/** Remove a staging directory made by {@link stageTarball}. */
-export function removeStaged(staged: string): void {
-  rmSync(path.dirname(staged), { recursive: true, force: true });
+/**
+ * Re-check, at the point of use, that a directory resolved earlier still
+ * resolves to itself inside the workspace. The workspace is mutable, and
+ * lifecycle scripts run between the publish and its verification, so a
+ * validated directory may since have become a link out of it.
+ */
+export function assertStillConfined(projectDir: string, boundary: string): void {
+  let resolved: string;
+  try {
+    resolved = realpathSync(projectDir);
+  } catch {
+    throw new InputError('the project directory has disappeared');
+  }
+  if (resolved !== projectDir || !isWithin(resolved, boundary, true)) {
+    throw new InputError(
+      'the project directory no longer resolves where it did. It must stay within GITHUB_WORKSPACE',
+    );
+  }
+  // A file swapped in at the same path resolves too, and npm could not run
+  // there: a verification failing for that reason would read as an
+  // unreadable registry and pass with a warning.
+  if (!isDirectory(resolved)) {
+    throw new InputError('the project directory has been replaced by something that is not a directory');
+  }
 }
