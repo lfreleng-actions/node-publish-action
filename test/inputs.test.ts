@@ -35,6 +35,7 @@ const BASE: RawInputs = {
   nexusUser: '',
   nexusPassword: 'placeholder-not-a-secret',
   authToken: '',
+  oidc: 'false',
   vaultMappingJson: '',
   opServiceAccountToken: '',
 };
@@ -166,6 +167,10 @@ describe('checkInputs: authentication modes', () => {
     expect(() => check(NONE)).toThrow('no registry credential configured');
   });
 
+  it('names oidc among the ways to supply one', () => {
+    expect(() => check(NONE)).toThrow("or set oidc to 'true' for trusted publishing");
+  });
+
   it('needs no credential for a dry run', () => {
     expect(check({ ...NONE, dryRun: 'true' }).inputs.authMode).toBe('none');
   });
@@ -203,6 +208,46 @@ describe('checkInputs: authentication modes', () => {
 
     expect(check({ ...NONE, nexusPassword: 'p', nexusUser: 'u' }).notices).toEqual([]);
     expect(check({ ...NONE, authToken: 't' }).notices).toEqual([]);
+  });
+});
+
+describe('checkInputs: OIDC trusted publishing', () => {
+  const NONE = { nexusPassword: '', authToken: '', loadCredential: 'false' };
+
+  it('selects the oidc mode, which needs no stored credential', () => {
+    expect(check({ ...NONE, oidc: 'true' }).inputs.authMode).toBe('oidc');
+  });
+
+  it('accepts only true or false', () => {
+    expect(() => check({ oidc: 'yes' })).toThrow("oidc must be 'true' or 'false'");
+  });
+
+  // Exclusive with every other mode, in both directions, dry run or not.
+  it.each([
+    ['oidc + auth_token', { authToken: 't' }],
+    ['oidc + nexus_password', { nexusPassword: 'p' }],
+    ['oidc + load_credential', { nexusPassword: '', loadCredential: 'true' }],
+  ])('rejects %s', (_label, overrides) => {
+    for (const dryRun of ['false', 'true']) {
+      expect(() => check({ ...NONE, ...overrides, oidc: 'true', dryRun })).toThrow(
+        'conflicting authentication modes. Choose one of: oidc, auth_token',
+      );
+    }
+  });
+
+  // npm attaches provenance itself under trusted publishing, and refuses
+  // the explicit flag for a restricted package.
+  it('rejects the provenance input alongside oidc', () => {
+    expect(() => check({ ...NONE, oidc: 'true', provenance: 'true' })).toThrow(
+      'provenance conflicts with oidc',
+    );
+    expect(check({ ...NONE, authToken: 't', provenance: 'true' }).inputs.provenance).toBe(true);
+  });
+
+  it('reports nexus_user as ignored under oidc', () => {
+    expect(check({ ...NONE, oidc: 'true', nexusUser: 'u' }).notices).toEqual([
+      expect.stringContaining('uses OIDC trusted publishing, which carries no username'),
+    ]);
   });
 });
 

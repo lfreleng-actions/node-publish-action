@@ -9,9 +9,11 @@ description: "Publishes a package to an npm registry, stamping the version into 
 # Composes node-create-npmrc-action for registry authentication, then
 # runs 'npm version' and 'npm publish' with verification. The npmrc
 # action registers a guaranteed post-job step that scrubs the
-# credential file, so this action adds no duplicate cleanup. Dry-run
-# mode skips the credential machinery entirely and performs a local
-# packing exercise with 'npm publish --dry-run'.
+# credential file, so this action adds no duplicate cleanup. Under
+# OIDC trusted publishing nothing is written: npm exchanges a GitHub
+# OIDC token for a short-lived one at publish time. Dry-run mode skips
+# the credential machinery entirely and performs a local packing
+# exercise with 'npm publish --dry-run'.
 
 inputs:
   # Mandatory
@@ -60,16 +62,17 @@ inputs:
     default: ""
   provenance:
     # yamllint disable-line rule:line-length
-    description: "Generate registry-native provenance ('true'/'false'); needs a registry with Sigstore provenance support (npmjs.org) plus OIDC; Nexus lacks support"
+    description: "Generate registry-native provenance ('true'/'false') under Basic or token auth; needs a registry with Sigstore provenance support (npmjs.org) plus 'id-token: write'; Nexus lacks support. Conflicts with oidc, which attaches provenance itself"
     required: false
     default: "false"
-  # Credential pass-through for node-create-npmrc-action (unused in
-  # dry-run mode). Two mutually exclusive authentication modes:
-  # Basic auth (nexus_user/nexus_password or load_credential), or a
-  # bearer token (auth_token).
+  # Three mutually exclusive authentication modes: Basic auth
+  # (nexus_user/nexus_password or load_credential) or a bearer token
+  # (auth_token), both written to an .npmrc by node-create-npmrc-action,
+  # or OIDC trusted publishing (oidc), which stores nothing. Dry-run
+  # mode writes no credential in any mode.
   nexus_user:
     # yamllint disable-line rule:line-length
-    description: "Basic auth username (default: calling repository name); ignored when auth_token selects token authentication"
+    description: "Basic auth username (default: calling repository name); ignored when auth_token or oidc selects another mode"
     required: false
     default: ""
   nexus_password:
@@ -79,9 +82,14 @@ inputs:
     default: ""
   auth_token:
     # yamllint disable-line rule:line-length
-    description: "Bearer token written as '_authToken'; use for registries that reject Basic auth (for example registry.npmjs.org). Excludes nexus_password and load_credential; nexus_user is ignored"
+    description: "Bearer token written as '_authToken'; use for registries that reject Basic auth (for example registry.npmjs.org). Excludes nexus_password, load_credential and oidc; nexus_user is ignored"
     required: false
     default: ""
+  oidc:
+    # yamllint disable-line rule:line-length
+    description: "Publish via npm OIDC trusted publishing ('true'/'false'); stores no credential. Needs 'id-token: write' (on caller and called workflow under workflow_call), npm >= 11.5.2 and Node.js >= 22.14.0. Excludes the other modes and the provenance input"
+    required: false
+    default: "false"
   load_credential:
     # yamllint disable-line rule:line-length
     description: "Fetch the password from 1Password via credential-load-action ('true'/'false')"
@@ -156,6 +164,7 @@ runs:
         INPUT_NEXUS_USER: ${{ inputs.nexus_user }}
         INPUT_NEXUS_PASSWORD: ${{ inputs.nexus_password }}
         INPUT_AUTH_TOKEN: ${{ inputs.auth_token }}
+        INPUT_OIDC: ${{ inputs.oidc }}
         INPUT_VAULT_MAPPING_JSON: ${{ inputs.vault_mapping_json }}
         INPUT_OP_SERVICE_ACCOUNT_TOKEN: ${{ inputs.op_service_account_token }}
       run: |
@@ -175,11 +184,12 @@ runs:
         node "${GITHUB_ACTION_PATH}/dist/prepare/index.js"
 
     # Dry-run mode performs no publish and sets up no credential, so it
-    # skips the credential machinery entirely. For real publishes the
-    # npmrc action writes the authenticated .npmrc and registers a
-    # guaranteed post-job step that scrubs it again.
+    # skips the credential machinery entirely, and so does OIDC: npm
+    # exchanges a token at publish time and there is nothing to write.
+    # For Basic and token auth the npmrc action writes the authenticated
+    # .npmrc and registers a guaranteed post-job step that scrubs it.
     - name: "Create authenticated .npmrc"
-      if: inputs.dry_run != 'true'
+      if: inputs.dry_run != 'true' && inputs.oidc != 'true'
       # yamllint disable-line rule:line-length
       uses: lfreleng-actions/node-create-npmrc-action@e0ff8adfc0591c86d8d07828bffab10f43096155 # v0.2.0
       with:

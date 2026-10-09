@@ -19,8 +19,11 @@ function config(flat: Record<string, unknown>, cliKeys: string[] = []): LoadedCo
     find: () => null,
     flat,
     cliKeys: new Set(cliKeys),
+    loadedFiles: { user: '', global: '' },
     flatten: (source, target) => Object.assign(target, source),
     validate: () => undefined,
+    getCredentialsByURI: () => ({}),
+    isDefault: () => true,
   };
 }
 

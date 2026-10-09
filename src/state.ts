@@ -39,7 +39,24 @@ export interface PublishState {
   readonly dryRun: boolean;
   readonly tag: string;
   readonly access: Access;
-  readonly provenance: boolean;
+  /**
+   * Provenance to state on the publish's command line, or null to leave
+   * it to npm's configuration, as a trusted publish must.
+   */
+  readonly provenance: boolean | null;
+  /** A provenance bundle to state on the command line, or ''. */
+  readonly provenanceFile: string;
+  /**
+   * The user and global configuration files npm loaded, pinned because a
+   * project .npmrc can select them and the .npmrc step replaces it.
+   */
+  readonly userconfig: string;
+  readonly globalconfig: string;
+  /**
+   * Whether `npm publish` may see the OIDC token endpoint: only for a real
+   * trusted publish, or a real publish signing provenance.
+   */
+  readonly idTokenEndpoint: boolean;
   /** The registry npm will publish to. */
   readonly registry: string;
   /** Every scope whose `:registry` key npm would consult, to pin. */
@@ -79,6 +96,7 @@ function field<T>(
 
 const isString = (value: unknown): value is string => typeof value === 'string';
 const isBoolean = (value: unknown): value is boolean => typeof value === 'boolean';
+const isBooleanOrNull = (value: unknown): value is boolean | null => value === null || isBoolean(value);
 const isAccess = (value: unknown): value is Access =>
   value === '' || value === 'public' || value === 'restricted';
 const isStrings = (value: unknown): value is string[] =>
@@ -143,7 +161,11 @@ export function readState(file: string, runnerTemp: string): PublishState {
     dryRun: field(record, 'dryRun', isBoolean, 'a boolean'),
     tag: field(record, 'tag', isString, 'a string'),
     access: field(record, 'access', isAccess, "'', 'public' or 'restricted'"),
-    provenance: field(record, 'provenance', isBoolean, 'a boolean'),
+    provenance: field(record, 'provenance', isBooleanOrNull, 'a boolean or null'),
+    provenanceFile: field(record, 'provenanceFile', isString, 'a string'),
+    userconfig: field(record, 'userconfig', isString, 'a string'),
+    globalconfig: field(record, 'globalconfig', isString, 'a string'),
+    idTokenEndpoint: field(record, 'idTokenEndpoint', isBoolean, 'a boolean'),
     registry: field(record, 'registry', isString, 'a string'),
     scopes: field(record, 'scopes', isStrings, 'a list of strings'),
   };

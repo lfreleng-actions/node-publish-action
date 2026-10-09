@@ -32,6 +32,10 @@ const STATE: PublishState = {
   tag: 'latest',
   access: '',
   provenance: false,
+  provenanceFile: '',
+  userconfig: '',
+  globalconfig: '',
+  idTokenEndpoint: false,
   registry: REGISTRY,
   scopes: [],
 };
@@ -39,7 +43,8 @@ const STATE: PublishState = {
 describe('publishArgs', () => {
   it('publishes the directory as JSON, confined to one package', () => {
     expect(publishArgs(STATE)).toEqual([
-      'publish', '--json', '--tag', 'latest', '--no-workspaces', '--registry', REGISTRY,
+      'publish', '--json', '--tag', 'latest', '--no-workspaces', '--no-provenance',
+      '--registry', REGISTRY, '--no-dry-run',
     ]);
   });
 
@@ -49,12 +54,43 @@ describe('publishArgs', () => {
     expect(args.slice(0, 2)).toEqual(['publish', '/t/npmpublish.x/package.tgz']);
   });
 
-  it('passes access and provenance only when set', () => {
-    const args = publishArgs({ ...STATE, access: 'restricted', provenance: true });
-    expect(args).toContain('--provenance');
+  it('passes access only when set', () => {
+    const args = publishArgs({ ...STATE, access: 'restricted' });
     expect(args.join(' ')).toContain('--access restricted');
-    expect(publishArgs(STATE)).not.toContain('--provenance');
     expect(publishArgs(STATE)).not.toContain('--access');
+  });
+
+  // The .npmrc step replaces the project's .npmrc before a Basic or token
+  // publish, so the provenance resolved beforehand is stated either way.
+  // A trusted publish leaves it to npm, which attaches provenance itself
+  // only while the setting is at its default.
+  it.each([
+    [true, ['--provenance'], ['--no-provenance']],
+    [false, ['--no-provenance'], ['--provenance']],
+    [null, [], ['--provenance', '--no-provenance']],
+  ])('states provenance %s as %j', (provenance, present, absent) => {
+    const args = publishArgs({ ...STATE, provenance });
+    for (const flag of present) expect(args).toContain(flag);
+    for (const flag of absent) expect(args).not.toContain(flag);
+  });
+
+  // npm refuses an explicit provenance alongside a provenance-file, even
+  // a false one, so a bundle is stated alone.
+  it('states a provenance bundle instead of the boolean', () => {
+    const args = publishArgs({ ...STATE, provenance: null, provenanceFile: '/b/bundle.json' });
+    expect(args).toContain('--provenance-file=/b/bundle.json');
+    expect(args.filter((arg) => /^--(no-)?provenance$/.test(arg))).toEqual([]);
+  });
+
+  // npm reads dry-run from its configuration, so an ambient setting must
+  // not turn the publish every earlier decision was made for into another.
+  it.each([
+    [true, '--dry-run', '--no-dry-run'],
+    [false, '--no-dry-run', '--dry-run'],
+  ])('states dry run %s as %s', (dryRun, present, absent) => {
+    const args = publishArgs({ ...STATE, dryRun });
+    expect(args).toContain(present);
+    expect(args).not.toContain(absent);
   });
 
   // A dry run still queries the registry, so --registry must apply to it.
@@ -74,6 +110,14 @@ describe('publishArgs', () => {
 
   it('passes no registry when none was resolved', () => {
     expect(publishArgs({ ...STATE, registry: '' })).not.toContain('--registry');
+  });
+
+  // A project .npmrc can select these, and the .npmrc step replaces it.
+  it('pins the configuration files prepare resolved', () => {
+    const args = publishArgs({ ...STATE, userconfig: '/u/clean.npmrc', globalconfig: '/g/npmrc' });
+    expect(args).toContain('--userconfig=/u/clean.npmrc');
+    expect(args).toContain('--globalconfig=/g/npmrc');
+    expect(publishArgs(STATE).some((arg) => /^--(user|global)config/.test(arg))).toBe(false);
   });
 
   it('passes every value as its own argument, never through a shell', () => {

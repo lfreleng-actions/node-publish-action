@@ -85,15 +85,31 @@ function pins(state: Pick<PublishState, 'registry' | 'scopes'>): string[] {
  *   prepublishOnly, and from 10.5.2 skips any publishConfig key already
  *   given on the command line, so a pin stops a script redirecting the
  *   publish after it was resolved.
+ * - The user and global configuration files are pinned to those prepare
+ *   resolved; see PublishState.userconfig.
+ * - Provenance, when the state carries a value, is stated either way, so
+ *   the .npmrc step replacing the project's .npmrc cannot change it. A
+ *   bundle is stated instead of the boolean, never with it: npm refuses
+ *   an explicit provenance alongside a provenance-file.
+ * - Dry run is stated either way. npm reads it from its configuration, so
+ *   an ambient dry-run=true would otherwise rehearse a publish that every
+ *   decision before it -- the token endpoint, the credential guard, the
+ *   .npmrc step -- made for a real one, or the reverse.
  */
 export function publishArgs(state: PublishState): string[] {
   const args = ['publish'];
   if (state.tarball !== '') args.push(state.tarball);
   args.push('--json', '--tag', state.tag, '--no-workspaces');
+  if (state.userconfig !== '') args.push(`--userconfig=${state.userconfig}`);
+  if (state.globalconfig !== '') args.push(`--globalconfig=${state.globalconfig}`);
   if (state.access !== '') args.push('--access', state.access);
-  if (state.provenance) args.push('--provenance');
+  if (state.provenanceFile !== '') {
+    args.push(`--provenance-file=${state.provenanceFile}`);
+  } else if (state.provenance !== null) {
+    args.push(state.provenance ? '--provenance' : '--no-provenance');
+  }
   if (state.registry !== '') args.push('--registry', state.registry, ...pins(state));
-  if (state.dryRun) args.push('--dry-run');
+  args.push(state.dryRun ? '--dry-run' : '--no-dry-run');
   return args;
 }
 

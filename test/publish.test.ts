@@ -64,6 +64,7 @@ function env(inputs: Record<string, string> = {}): NodeJS.ProcessEnv {
     INPUT_TAG: 'latest',
     INPUT_PROVENANCE: 'false',
     INPUT_LOAD_CREDENTIAL: 'false',
+    INPUT_OIDC: 'false',
     ...inputs,
   };
 }
@@ -191,6 +192,53 @@ describe('publish: the state and the npm it runs', () => {
     const other = makeWorkDir(runnerTemp);
     const forged = writeState(other, { ...state, npmDir: home });
     expect(() => publish(forged, env(), recorder().io)).toThrow('is not npm');
+  });
+});
+
+describe('publish: mode isolation', () => {
+  const REPORT = '{"p":{"name":"p","version":"7.7.7","filename":"p-7.7.7.tgz"}}';
+  const AMBIENT = {
+    ACTIONS_ID_TOKEN_REQUEST_URL: 'https://token.actions.example.invalid/',
+    ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'request-token',
+    NPM_ID_TOKEN: 'ambient-id-token',
+  };
+
+  /** Which of the OIDC variables each npm run saw. */
+  async function seen(inputs: Record<string, string>): Promise<Record<string, string[]>> {
+    write('proj/package.json', '{"name":"p","version":"7.7.7"}');
+    const { statePath } = await prepare(env({ ...AMBIENT, ...inputs }));
+    const visible: Record<string, string[]> = {};
+    const runner: NpmRunner = (args, options) => {
+      visible[args[0] ?? ''] = Object.keys(AMBIENT).filter((name) => name in options.env);
+      if (args[0] === 'publish') {
+        if (options.stdoutFile) writeFileSync(options.stdoutFile, REPORT);
+        return { status: 0, stdout: REPORT, stderr: '' };
+      }
+      return { status: 0, stdout: args[0] === 'view' ? '7.7.7\n' : '', stderr: '' };
+    };
+    publish(statePath, env({ ...AMBIENT, ...inputs }), recorder().io, runner);
+    return visible;
+  }
+
+  // A job granting id-token: write for some other step must not have its
+  // token publish turned into a trusted publish behind its back.
+  it('withholds the endpoint from every run of a token publish', async () => {
+    expect(await seen({ INPUT_DRY_RUN: 'false', INPUT_AUTH_TOKEN: 't' })).toEqual({
+      version: [],
+      publish: [],
+      view: [],
+    });
+  });
+
+  it('passes the endpoint to the publish of a provenance-signing publish alone', async () => {
+    const visible = await seen({ INPUT_DRY_RUN: 'false', INPUT_AUTH_TOKEN: 't', INPUT_PROVENANCE: 'true' });
+    expect(visible['publish']).toEqual(['ACTIONS_ID_TOKEN_REQUEST_URL', 'ACTIONS_ID_TOKEN_REQUEST_TOKEN']);
+    expect(visible['version']).toEqual([]);
+    expect(visible['view']).toEqual([]);
+  });
+
+  it('withholds the endpoint from a dry run, which exchanges nothing', async () => {
+    expect((await seen({ INPUT_PROVENANCE: 'true' }))['publish']).toEqual([]);
   });
 });
 

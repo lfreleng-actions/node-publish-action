@@ -35,6 +35,10 @@ const STATE: PublishState = {
   tag: 'latest',
   access: 'public',
   provenance: false,
+  provenanceFile: '',
+  userconfig: '',
+  globalconfig: '',
+  idTokenEndpoint: false,
   registry: 'https://registry.example.invalid/',
   scopes: ['@a', '@b c'],
 };
@@ -55,6 +59,12 @@ describe('state', () => {
     const file = writeState(workDir, STATE);
     expect(path.basename(file)).toBe(STATE_NAME);
     expect(readState(file, runnerTemp)).toEqual(STATE);
+  });
+
+  // A trusted publish leaves provenance to npm's configuration.
+  it('round-trips a provenance left to npm', () => {
+    const file = writeState(workDir, { ...STATE, provenance: null });
+    expect(readState(file, runnerTemp).provenance).toBeNull();
   });
 
   it('accepts the staged tarball in the same work directory', () => {
@@ -96,6 +106,11 @@ describe('state', () => {
     ['not an object', '[]', 'does not hold an object'],
     ['another schema', JSON.stringify({ ...STATE, schema: 2 }), 'schema 2'],
     ['a string boolean', JSON.stringify({ ...STATE, dryRun: 'false' }), 'dryRun is not a boolean'],
+    [
+      'a string provenance',
+      JSON.stringify({ ...STATE, provenance: 'true' }),
+      'provenance is not a boolean or null',
+    ],
     ['an unknown access', JSON.stringify({ ...STATE, access: 'internal' }), 'access is not'],
     ['scopes holding a number', JSON.stringify({ ...STATE, scopes: ['@a', 1] }), 'scopes is not'],
     ['a missing registry', JSON.stringify({ ...STATE, registry: undefined }), 'registry is not'],

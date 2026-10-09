@@ -338,8 +338,11 @@ describe('resolveEffectiveRegistry', () => {
           find: () => null,
           flat: {},
           cliKeys: new Set<string>(),
+          loadedFiles: { user: '', global: '' },
           flatten,
           validate: () => undefined,
+          getCredentialsByURI: () => ({}),
+          isDefault: () => true,
         };
         expect(() =>
           resolveEffectiveRegistry({
