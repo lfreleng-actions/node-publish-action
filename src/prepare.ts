@@ -16,6 +16,9 @@
  * tested as a function; src/bin/prepare.ts does the IO.
  */
 
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+
 import {
   assertNoWorkspaceSelector,
   checkInputs,
@@ -31,13 +34,23 @@ import {
   type Manifest,
   type NpmInternals,
 } from './npm-internals.js';
+import {
+  assertNoStoredCredential,
+  assertOidcEndpoint,
+  assertToolchain,
+  checkOidcProvenance,
+  needsIdTokenEndpoint,
+  PROVENANCE_EXCHANGE_NOTICE,
+  provenanceVerdict,
+} from './oidc.js';
+import { definedHooks, PUBLISH_HOOKS } from './publish-command.js';
 import { publishFlags } from './publish-options.js';
 import { assertSupportedNpm, resolveEffectiveRegistry, type RegistryResolution } from './registry.js';
+import { makeWorkDir, removeWorkDir, writeState } from './state.js';
 import {
   confineNodeVersionFile,
   confineProject,
   printable,
-  removeStaged,
   resolveTarball,
   runnerDirs,
   stageTarball,
@@ -47,11 +60,13 @@ export interface PrepareResult {
   readonly inputs: CheckedInputs;
   /** The resolved project directory. */
   readonly projectDir: string;
-  /** The staged archive in RUNNER_TEMP, or '' when packing the project. */
+  /** The staged archive in the work directory, or '' when packing the project. */
   readonly tarball: string;
   readonly resolution: RegistryResolution;
   /** The npm whose code made the decisions. */
   readonly npmVersion: string;
+  /** The state file the publish step reads. */
+  readonly statePath: string;
   /** Notices to emit: accepted, but worth saying. */
   readonly notices: readonly string[];
 }
@@ -120,15 +135,22 @@ async function loadConfig(
  * Run every check and resolution, in the order a failure is cheapest:
  * text first, then paths, then npm.
  *
- * `load` is the npm loader; tests pass one bound to a specific npm.
+ * `load` is the npm loader and `nodeVersion` the Node.js running the
+ * publish; tests pass their own.
  */
 export async function prepare(
   env: NodeJS.ProcessEnv,
   load: () => NpmInternals = loadNpmInternals,
+  nodeVersion: string = process.versions.node,
 ): Promise<PrepareResult> {
   assertNoWorkspaceSelector(env);
   const dirs = runnerDirs(env);
-  const { inputs, notices } = checkInputs(readRawInputs(env));
+  const checked = checkInputs(readRawInputs(env));
+  const { inputs } = checked;
+  const notices = [...checked.notices];
+  const oidc = inputs.authMode === 'oidc';
+  // A rehearsal needs no token, so a dry run is not held to the grant.
+  if (oidc && !inputs.dryRun) assertOidcEndpoint(env);
   confineNodeVersionFile(inputs.nodeVersionFile, dirs);
   const projectDir = confineProject(inputs.pathPrefix, dirs);
   const source = inputs.tarballPath === '' ? '' : resolveTarball(inputs.tarballPath, dirs);
@@ -137,10 +159,15 @@ export async function prepare(
   // decides. Found from the executable, not from 'npm root -g', whose
   // answer is itself configuration.
   const internals = load();
+  // Before anything else of npm's is asked, so an old toolchain fails for
+  // what it is. Dry runs too: a rehearsal that passed on a toolchain the
+  // real publish would refuse defeats the point of rehearsing.
+  if (oidc) assertToolchain(internals.npmVersion, nodeVersion);
   const config = await loadConfig(internals, projectDir, inputs.registryUrl, env);
 
-  const tarball = source === '' ? '' : stageTarball(source, dirs.runnerTemp);
+  const workDir = makeWorkDir(dirs.runnerTemp);
   try {
+    const tarball = source === '' ? '' : stageTarball(source, workDir);
     // The manifest npm will publish. For a tarball that is the one *inside
     // the archive*, not the working directory's: its scope and
     // publishConfig decide the registry, and its version is what ships.
@@ -165,11 +192,71 @@ export async function prepare(
       npmVersion: internals.npmVersion,
       pickRegistry: internals.pickRegistry,
     });
-    return { inputs, projectDir, tarball, resolution, npmVersion: internals.npmVersion, notices };
+    const provenance = provenanceVerdict(config, internals.npmVersion, publishConfig);
+    if (oidc) {
+      const notice = checkOidcProvenance(provenance);
+      if (notice !== null) notices.push(notice);
+      // Checked against the registry npm will publish to, which a scoped
+      // package can move away from registry_url. A dry run exchanges
+      // nothing, so has nothing to fall back from.
+      if (!inputs.dryRun) assertNoStoredCredential(config, resolution.registry);
+      // Hooks run inside npm publish, after this check, and are repository
+      // code: one can introduce a scope this resolution never saw, or write
+      // a credential of its own. Nothing checked beforehand binds them;
+      // a tarball publish runs none.
+      if (!inputs.dryRun && tarball === '') {
+        const hooks = definedHooks(
+          readFileSync(path.join(projectDir, 'package.json'), 'utf8'),
+          PUBLISH_HOOKS,
+        );
+        if (hooks.length > 0) {
+          notices.push(
+            `This trusted publish runs lifecycle script(s): ${hooks.join(', ')}. ` +
+              'The stored-credential check ran before them, for the registry ' +
+              'resolved now; a script that changes the scope or writes ' +
+              'credentials acts after it. Publish through tarball_path, which ' +
+              'runs no scripts, to rule that out.',
+          );
+        }
+      }
+    }
+    const keepEndpoint = needsIdTokenEndpoint(
+      inputs.dryRun,
+      oidc,
+      inputs.provenance || provenance.provenance,
+    );
+    if (keepEndpoint && !oidc) notices.push(PROVENANCE_EXCHANGE_NOTICE);
+    const statePath = writeState(workDir, {
+      schema: 1,
+      npmVersion: internals.npmVersion,
+      npmDir: internals.npmDir,
+      projectDir,
+      tarball,
+      publishVersion: inputs.publishVersion,
+      dryRun: inputs.dryRun,
+      tag: inputs.tag,
+      access: inputs.access,
+      provenance: inputs.provenance,
+      // The effective setting, not the input alone: an .npmrc, an
+      // npm_config_ variable or publishConfig can enable provenance too,
+      // and withholding the endpoint from that publish would break it.
+      idTokenEndpoint: keepEndpoint,
+      registry: resolution.registry,
+      scopes: resolution.scopes,
+    });
+    return {
+      inputs,
+      projectDir,
+      tarball,
+      resolution,
+      npmVersion: internals.npmVersion,
+      statePath,
+      notices,
+    };
   } catch (cause) {
-    // The cleanup step keys off this step's tarball output, which a
-    // failure never writes, so the staged copy is removed here.
-    if (tarball !== '') removeStaged(tarball);
+    // The cleanup step keys off this step's state output, which a failure
+    // never writes, so the work directory is removed here.
+    removeWorkDir(workDir);
     throw cause;
   }
 }

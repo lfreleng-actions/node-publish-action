@@ -92,6 +92,26 @@ export interface LoadedConfig {
    * which npm's own error carries verbatim, credentials included.
    */
   validate(): void;
+  /**
+   * The credentials npm would use for `uri`: npm's own lookup, which
+   * `npm publish` calls on the registry it picked. It reads one exact
+   * nerf-darted key per credential and walks no ancestor paths.
+   */
+  getCredentialsByURI(uri: string): Credentials;
+  /**
+   * Whether `key` holds its default, set in no configuration layer. npm's
+   * trusted publishing enables provenance by itself only while this is
+   * true of `provenance`.
+   */
+  isDefault(key: string): boolean;
+}
+
+/** The fields of npm's credential lookup this action inspects. */
+export interface Credentials {
+  readonly token?: unknown;
+  readonly username?: unknown;
+  readonly certfile?: unknown;
+  readonly keyfile?: unknown;
 }
 
 export interface LoadConfigOptions {
@@ -155,6 +175,8 @@ interface ConfigInstance {
   readonly data?: Map<string, { raw?: Record<string, unknown> }>;
   readonly globalPrefix?: unknown;
   validate?: () => boolean;
+  getCredentialsByURI?: (uri: string) => Credentials;
+  isDefault?: (key: string) => boolean;
 }
 
 type ConfigConstructor = new (options: Record<string, unknown>) => ConfigInstance;
@@ -218,6 +240,20 @@ async function loadConfigFrom(
     target: Record<string, unknown>,
   ) => void;
   const cliKeys = new Set(Object.keys(instance.data?.get('cli')?.raw ?? {}));
+  // Present on every npm from 8 (measured to 12), and needed only by the
+  // trusted-publishing checks, which require npm 11.5.2. npm 7 lacks
+  // isDefault, and its configuration must still load for registry
+  // resolution, so absence fails closed where a lookup is asked for rather
+  // than here -- never falling back to a guess.
+  const lookup = <A extends unknown[], R>(
+    name: 'getCredentialsByURI' | 'isDefault',
+  ): ((...args: A) => R) => {
+    const method = instance[name] as ((...args: A) => R) | undefined;
+    if (typeof method === 'function') return (...args) => method.apply(instance, args);
+    return () => {
+      throw new NpmInternalsError(`npm ${npmVersion}: @npmcli/config has no ${name}.`);
+    };
+  };
   return {
     get: (key) => instance.get(key),
     find: (key) => instance.find(key) as ConfigLayer | null,
@@ -240,6 +276,8 @@ async function loadConfigFrom(
         );
       }
     },
+    getCredentialsByURI: lookup<[string], Credentials>('getCredentialsByURI'),
+    isDefault: lookup<[string], boolean>('isDefault'),
   };
 }
 

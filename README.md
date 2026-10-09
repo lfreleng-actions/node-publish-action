@@ -50,14 +50,12 @@ steps:
 
 ## Requirements
 
-The action needs `jq`, `realpath`, `mktemp` and `tr` on the runner.
-GitHub-hosted Ubuntu runners include these tools; minimal self-hosted
-or non-Linux runners
-must provide them. The action checks for them up front and fails with
-a clear error naming any missing tool. It installs Node.js and npm via
-the pinned `actions/setup-node` action, without dependency caching.
-Real publishes need egress to the target registry; dry-run mode
-publishes nothing and writes no credential.
+The action needs no tools on the runner beyond `bash` and what
+`actions/setup-node` installs: every check and every npm invocation
+runs in its own bundled programs on the selected Node.js. It installs
+Node.js and npm via the pinned `actions/setup-node` action, without
+dependency caching. Real publishes need egress to the target
+registry; dry-run mode publishes nothing and writes no credential.
 
 The action needs **npm 8 or later**, the npm that `node_version`
 selects, and fails with a clear error on anything older. It resolves
@@ -70,6 +68,8 @@ release shipped npm 7: it came with Node 15 and the pre-LTS Node 16
 releases and nothing else. Node.js 14 and older LTS lines carry npm 6.
 Registry precedence also changed in **npm 10.5.2**; see
 [Effective Registry](#effective-registry) for what differs below it.
+OIDC trusted publishing needs more: **npm 11.5.2 and Node.js 22.14.0**;
+see [OIDC trusted publishing](#oidc-trusted-publishing).
 
 ## Inputs
 
@@ -86,10 +86,11 @@ Registry precedence also changed in **npm 10.5.2**; see
 | node_version_file        | False    | `''`     | File containing the Node.js version, such as `.nvmrc`; overrides `node_version`              |
 | tag                      | False    | `latest` | npm distribution tag                                                                         |
 | access                   | False    | `''`     | Package access: `public`, `restricted` or unset                                              |
-| provenance               | False    | `false`  | Generate registry-native provenance; needs registry and OIDC support                         |
-| nexus_user               | False    | `''`     | Basic auth username (default: calling repository name); ignored by token auth                |
+| provenance               | False    | `false`  | Generate registry-native provenance (Basic/token auth); needs registry and OIDC support      |
+| nexus_user               | False    | `''`     | Basic auth username (default: calling repository name); ignored by token and OIDC auth       |
 | nexus_password           | False    | `''`     | Registry password for Basic auth; required for real publishes unless another mode            |
 | auth_token               | False    | `''`     | Bearer token written as `_authToken`; for registries rejecting Basic auth                    |
+| oidc                     | False    | `false`  | Publish through npm OIDC trusted publishing; stores no credential                            |
 | load_credential          | False    | `false`  | Fetch the password from 1Password via credential-load-action                                 |
 | vault_mapping_json       | False    | `''`     | JSON mapping repository owner to 1Password vault (with `load_credential`)                    |
 | op_service_account_token | False    | `''`     | 1Password service account token (with `load_credential`)                                     |
@@ -144,9 +145,12 @@ The `nexus_user`, `scope` and credential inputs pass through to
    [Effective Registry](#effective-registry). This runs before
    authentication because the next step replaces the project's
    `.npmrc`, one of the files resolution reads
-3. **Authenticate** (real publishes): `node-create-npmrc-action`
-   writes an authenticated `.npmrc` into the project directory, keyed
-   to the resolved registry
+3. **Authenticate** (real Basic or token publishes):
+   `node-create-npmrc-action` writes an authenticated `.npmrc` into the
+   project directory, keyed to the resolved registry. Trusted
+   publishing writes nothing; the checking step has instead confirmed
+   the toolchain, the token endpoint, and that no stored credential
+   could stand in for the exchange
 4. **Stamp**: `npm version <X> --no-git-tag-version
    --allow-same-version --ignore-scripts --no-workspaces` updates
    `package.json`, with the result read back and verified. A
@@ -167,6 +171,15 @@ The `nexus_user`, `scope` and credential inputs pass through to
    or index asynchronously), while a readable package with the wrong
    version fails the action
 
+Steps 4 to 6 run as one program. The checking step records every
+decision in a state file in a private directory under `RUNNER_TEMP`,
+outside the checked-out tree, and the publish reads that file alone,
+checked against one schema. It runs npm as the same npm whose code
+resolved the registry, refusing to publish if `PATH` now names a
+different one, and re-checks the project directory before stamping
+and again before verifying, since lifecycle scripts run between them.
+An `always()` step removes the directory at the end.
+
 ## Publish Output Parsing
 
 npm runs lifecycle scripts with inherited stdio, so whatever
@@ -183,10 +196,18 @@ generation's layout. npm 10 placed those at the top level; npm 11
 keys the object by package name.
 
 If npm's exit status is non-zero, the action reports a publish
-failure. If npm **succeeded** and the action still cannot read the
-metadata, it says so explicitly and states that the package reached
-the registry, because retrying that publish cannot succeed — it fails
-with `EPUBLISHCONFLICT` on a version that the registry already holds.
+failure — unless npm's output already reports the requested version as
+published. npm prints that report once the registry has accepted the
+upload and not before, and from npm 10 before the `publish` and
+`postpublish` scripts run, so a failing script can follow a completed
+publish. The action then says the package has probably reached the
+registry and to check it before retrying.
+
+If npm **succeeded** and the action still cannot read the metadata, it
+says so explicitly and states that the package reached the registry,
+because retrying that publish cannot succeed — it fails with
+`EPUBLISHCONFLICT` on a version that the registry already holds. The
+same applies when verification reads back a different version.
 
 > [!NOTE]
 > The action tolerates hooks that print to stdout, but stdout is the
@@ -211,9 +232,19 @@ against a registry host that does not exist.
 
 ## Authentication Modes
 
-Two mutually exclusive modes. Supplying both fails the action rather
-than picking a winner, since the effective credential would otherwise
-be ambiguous.
+Three mutually exclusive modes. Supplying more than one fails the
+action rather than picking a winner, since the effective credential
+would otherwise be ambiguous.
+
+<!-- markdownlint-disable MD013 -->
+
+| Mode               | Inputs                                 | Stored credential     |
+| ------------------ | -------------------------------------- | --------------------- |
+| Basic auth         | `nexus_password`, or `load_credential` | `.npmrc` `_auth`      |
+| Bearer token       | `auth_token`                           | `.npmrc` `_authToken` |
+| Trusted publishing | `oidc: 'true'`                         | None                  |
+
+<!-- markdownlint-enable MD013 -->
 
 ### Basic auth (Nexus)
 
@@ -229,16 +260,108 @@ reject Basic auth for publishing, notably `registry.npmjs.org`,
 require this form.
 
 `nexus_user` plays no part in token publishing, since a bearer token
-carries no username. Setting it alongside `auth_token` is inert
-rather than an error — callers that compute it unconditionally, such
-as a matrix publishing to both Nexus and npmjs.org, would otherwise
-have to strip it per target. The action emits a `::notice::` naming
-it as ignored.
+carries no username. Setting it alongside `auth_token` (or `oidc`) is
+inert rather than an error — callers that compute it unconditionally,
+such as a matrix publishing to both Nexus and npmjs.org, would
+otherwise have to strip it per target. The action emits a
+`::notice::` naming it as ignored.
 
-> [!NOTE]
-> OIDC trusted publishing, which stores no credential at all, is
-> tracked separately in
-> [issue #28](https://github.com/lfreleng-actions/node-publish-action/issues/28).
+### OIDC trusted publishing
+
+Set `oidc: 'true'`. Nothing stores a secret: at publish time npm
+exchanges the job's GitHub OIDC token for a short-lived publish token,
+scoped to the one package. The action writes no `.npmrc`.
+
+<!-- markdownlint-disable MD046 -->
+
+```yaml
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write  # mandatory for trusted publishing
+    steps:
+      - uses: actions/checkout@<sha>
+        with:
+          persist-credentials: false
+      - uses: lfreleng-actions/node-publish-action@<sha>
+        with:
+          publish_version: '1.2.3'
+          registry_url: 'https://registry.npmjs.org/'
+          node_version: '24'
+          oidc: 'true'
+```
+
+<!-- markdownlint-enable MD046 -->
+
+**Set up the trusted publisher first.** On npmjs.com, open the
+package's settings and add a GitHub Actions trusted publisher naming
+the organisation or user, the repository, and the **workflow
+filename** (see the npm documentation on
+[trusted publishers](https://docs.npmjs.com/trusted-publishers)).
+A package must exist before it can have a trusted publisher, so a
+brand-new package needs its first version published another way.
+
+> [!IMPORTANT]
+> **Reusable workflows.** When this action runs inside a reusable
+> workflow called with `workflow_call`, npm checks the filename of the
+> **calling** workflow, not the reusable one. Register the caller's
+> file (`release.yaml` in your repository, say), and grant
+> `id-token: write` on **both** the calling job and the called
+> workflow's job; GitHub issues no token unless both allow it.
+
+Further requirements, each checked up front with a remedy:
+
+- **npm 11.5.2 or later and Node.js 22.14.0 or later**, as selected by
+  `node_version`. Node 22 ships npm 10, and even Node 24.0.0 ships
+  npm 11.3.0, so pick a current Node 24 release. The floor excludes
+  11.5.1: it auto-enables provenance before checking visibility, so a
+  restricted publish fails outright ([npm/cli#8467]). The action runs
+  `actions/setup-node` itself, so upgrading npm under a different
+  Node installation beforehand has no effect. The action holds dry runs
+  to the same floor, since a rehearsal on a toolchain the real publish
+  rejects proves nothing.
+- **`id-token: write`** on the job. Without it the action fails before
+  stamping anything, naming the grant.
+- **No stored credential for the registry.** npm's exchange is best
+  effort: if it fails, npm falls back to any credential it can find,
+  which would publish under a long-lived token while the caller
+  believes none exists. The action refuses to proceed when one exists.
+  It asks npm's own `getCredentialsByURI`, on the registry npm will
+  actually publish to, so `.npmrc` files at every level and
+  `npm_config_*` variables count as npm counts them.
+- **GitHub-hosted runners**, and a `repository.url` in `package.json`
+  matching the GitHub repository. npm enforces both; the action cannot
+  check them in advance.
+
+[npm/cli#8467]: https://github.com/npm/cli/pull/8467
+
+### Mode isolation
+
+npm attempts a trusted-publish exchange whenever the job's OIDC token
+endpoint is available. A Basic or token publish in a job that grants
+`id-token: write` for some other step, such as attestation, could
+have its credential replaced without any sign. The action withholds
+the endpoint from every npm invocation except a real trusted publish,
+or a real publish with provenance enabled, which signs with the
+workflow identity. It removes `NPM_ID_TOKEN` from every invocation,
+since npm reads it ahead of the endpoint, matching variable names
+case-insensitively as Windows does.
+
+The provenance case is the one isolation cannot cover. Signing and
+the exchange read the same endpoint, and npm attempts the exchange
+whenever the endpoint exists, so a Basic or token publish with provenance
+authenticates through a trusted publisher if the package has one.
+The action says so in a notice; use `oidc: 'true'` to make that the
+declared mode.
+
+Trusted publishing checks for stored credentials before npm runs, so
+for a directory publish it cannot bind `prepack`, `prepare` or
+`prepublishOnly` scripts, which run inside npm and could add a scope
+or a credential of their own. The action names such scripts in a
+notice; publish through `tarball_path`, which runs none, to rule this
+out.
 
 ## Workspaces
 
@@ -252,7 +375,7 @@ verifies and reports a single package.
 To publish more than one workspace package, call the action once per
 package with its own `path_prefix`.
 
-A workspace selected through `npm_config_workspace` fails validation.
+A workspace selected through `npm_config_workspace` fails the input checks.
 One selected through a `workspace=` entry in an `.npmrc` fails at the
 stamp instead, before anything reaches the registry: npm exposes such
 a selection through neither `npm config get workspace` nor `npm config
@@ -271,16 +394,36 @@ step, so a project-level selector reaches the stamp there too.
 `node-create-npmrc-action` masks the credential material, writes the
 `.npmrc` with restrictive permissions and registers a guaranteed
 post-job step that scrubs the file again — including when later steps
-fail. This action adds no duplicate cleanup logic.
+fail. This action adds no duplicate cleanup logic. Trusted publishing
+stores no credential, so there is nothing to scrub.
 
 ## Provenance
 
-The `provenance` input passes `--provenance` to npm, generating
-registry-native Sigstore provenance. This works against registries
-with provenance support (npmjs.org) and requires an OIDC token
-(`id-token: write` permission). Nexus has no provenance support, so
-leave the input at `false` for Nexus targets; generate GitHub
-artifact attestations for the packed tarball instead.
+Under **trusted publishing** npm attaches provenance by itself, for a
+public package published from a public repository, so the action
+refuses the `provenance` input alongside `oidc`. It refuses an ambient
+setting too:
+`provenance` or `provenance-file` enabled through an `.npmrc`,
+`npm_config_provenance` or `publishConfig`. It adds nothing, and npm
+refuses explicit provenance for a restricted package.
+
+Turning provenance *off* works, but the sources differ, because npm
+auto-enables it while the configuration setting holds its default,
+and not otherwise:
+
+| `provenance=false` set in            | Trusted publish attests? |
+| ------------------------------------ | ------------------------ |
+| `.npmrc` or `npm_config_provenance`  | No                       |
+| `package.json` `publishConfig` alone | Yes: npm overrides it    |
+
+The action emits a notice explaining which applies.
+
+Under **Basic or token auth** the `provenance` input passes
+`--provenance` to npm, generating registry-native Sigstore provenance.
+This works against registries with provenance support (npmjs.org) and
+needs `id-token: write`. Nexus has no provenance support, so leave the
+input at `false` for Nexus targets; generate GitHub artifact
+attestations for the packed tarball instead.
 
 ## Effective Registry
 
@@ -436,7 +579,7 @@ Three consequences follow from the tarball being the artefact:
   npm's, the version compared is the one npm sends: a `v1.2.3` in the
   archive publishes as `1.2.3`, and matches that request.
   The action copies the archive into `RUNNER_TEMP` **before** reading
-  it, validates the copy, and every later step uses that copy; a
+  it, validates the copy, and the publish uses that copy; a
   final `always()` step removes it. No check around a read of the
   workspace path could be atomic with that read, so the action moves
   the bytes outside the checked-out tree first — the version, identity
@@ -461,8 +604,9 @@ Relative values for `path_prefix` resolve against `GITHUB_WORKSPACE`,
 not the current working directory, so behaviour stays deterministic
 when a calling workflow sets a custom working directory. The project
 directory must resolve within `GITHUB_WORKSPACE` and contain a
-`package.json`; the boundary check re-runs in every later step that
-touches the path. Paths that escape the workspace fail the action.
+`package.json`. The publish re-checks that it still resolves to the
+same place before stamping and again before verifying. Paths that
+escape the workspace fail the action.
 
 ## Notes
 
@@ -493,8 +637,10 @@ touches the path. Paths that escape the workspace fail the action.
 
 The action remains a composite action, so it can call
 `actions/setup-node` to select the Node.js version the publish runs
-under. Logic that needs real testing lives in TypeScript under `src/`
-and runs as a small Node program invoked from `action.yaml`.
+under. Every step after that runs one of two bundled TypeScript
+programs: `dist/prepare` checks the inputs and resolves the registry,
+and `dist/publish` stamps, publishes and verifies. Their logic lives
+under `src/` as functions with unit tests.
 
 ```bash
 npm ci          # install the toolchain
@@ -520,11 +666,11 @@ Two different Node.js floors apply, and they are not the same number:
   (`^20.19.0 || ^22.13.0 || >=24`), the range ESLint, vitest and vite
   all support. It governs
   `npm ci` and the commands above
-- **The bundle** targets `node18`, because it runs on whatever
-  `node_version` selected for the publish rather than on the toolchain.
-  The publish step runs it with `--selftest` ahead of npm, so a runtime
-  too old to load it fails the run while nothing has yet reached the
-  registry
+- **The bundles** target `node18`, because they run on whatever
+  `node_version` selected for the publish rather than on the
+  toolchain. Each step runs its bundle with `--selftest` first, so a
+  runtime too old to load it fails the run while nothing has yet
+  reached the registry
 
 The repository **commits** `dist/`. GitHub runs an action straight
 from the repository and offers no build step, so the bundle has to be

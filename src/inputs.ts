@@ -32,6 +32,7 @@ export interface RawInputs {
   readonly nexusUser: string;
   readonly nexusPassword: string;
   readonly authToken: string;
+  readonly oidc: string;
   readonly vaultMappingJson: string;
   readonly opServiceAccountToken: string;
 }
@@ -52,6 +53,7 @@ export const INPUT_VARIABLES: Readonly<Record<keyof RawInputs, string>> = {
   nexusUser: 'INPUT_NEXUS_USER',
   nexusPassword: 'INPUT_NEXUS_PASSWORD',
   authToken: 'INPUT_AUTH_TOKEN',
+  oidc: 'INPUT_OIDC',
   vaultMappingJson: 'INPUT_VAULT_MAPPING_JSON',
   opServiceAccountToken: 'INPUT_OP_SERVICE_ACCOUNT_TOKEN',
 };
@@ -68,7 +70,7 @@ export function readRawInputs(env: NodeJS.ProcessEnv): RawInputs {
 export type Access = '' | 'public' | 'restricted';
 
 /** How the publish authenticates. 'none' is valid only for a dry run. */
-export type AuthMode = 'basic' | 'token' | 'none';
+export type AuthMode = 'basic' | 'token' | 'oidc' | 'none';
 
 /** The inputs once checked, in the types later stages consume. */
 export interface CheckedInputs {
@@ -167,34 +169,41 @@ export function checkRegistryUrl(value: string, dryRun: boolean): string {
 
 /**
  * Exactly one authentication mode. Basic auth folds a password into an
- * .npmrc entry and token auth writes a bearer token, so accepting both
- * would leave the effective credential ambiguous.
+ * .npmrc entry, token auth writes a bearer token, and OIDC trusted
+ * publishing stores nothing at all, so accepting more than one would leave
+ * the effective credential ambiguous.
  *
  * nexus_user carries no secret and selects no mode, so it never conflicts
  * with one. Callers computing it unconditionally -- matrix publishes mixing
- * Nexus and npmjs targets -- would break if this rejected it, so a token
- * publish reports it as ignored instead.
+ * Nexus and npmjs targets -- would break if this rejected it, so a token or
+ * OIDC publish reports it as ignored instead.
  */
-function checkAuthMode(raw: RawInputs, dryRun: boolean, loadCredential: boolean): {
+function checkAuthMode(
+  raw: RawInputs,
+  dryRun: boolean,
+  loadCredential: boolean,
+  oidc: boolean,
+): {
   mode: AuthMode;
   notices: string[];
 } {
   const token = raw.authToken !== '';
   const basic = loadCredential || raw.nexusPassword !== '';
-  if (token && basic) {
+  if ([oidc, token, basic].filter(Boolean).length > 1) {
     throw new InputError(
-      'conflicting authentication modes. Choose one of: auth_token, or ' +
-        'Basic auth (nexus_password or load_credential)',
+      'conflicting authentication modes. Choose one of: oidc, auth_token, ' +
+        'or Basic auth (nexus_password or load_credential)',
     );
   }
-  const mode: AuthMode = token ? 'token' : basic ? 'basic' : 'none';
+  const mode: AuthMode = oidc ? 'oidc' : token ? 'token' : basic ? 'basic' : 'none';
   // A real publish needs a credential source; failing here is clearer
   // than an authentication failure mid-publish.
   if (!dryRun && mode === 'none') {
     throw new InputError(
       "no registry credential configured. Provide nexus_password, set " +
         "load_credential to 'true' (with vault_mapping_json and " +
-        'op_service_account_token), or provide auth_token',
+        "op_service_account_token), provide auth_token, or set oidc to " +
+        "'true' for trusted publishing",
     );
   }
   // Only emptiness is checked, never the values: these are secrets.
@@ -211,10 +220,11 @@ function checkAuthMode(raw: RawInputs, dryRun: boolean, loadCredential: boolean)
     }
   }
   const notices: string[] = [];
-  if (raw.nexusUser !== '' && mode === 'token') {
+  if (raw.nexusUser !== '' && (mode === 'token' || mode === 'oidc')) {
     notices.push(
       'Ignoring nexus_user: it applies to Basic auth, and this publish ' +
-        'uses token authentication, which carries no username.',
+        `uses ${mode === 'oidc' ? 'OIDC trusted publishing' : 'token authentication'}, ` +
+        'which carries no username.',
     );
   }
   return { mode, notices };
@@ -243,11 +253,23 @@ export function checkInputs(raw: RawInputs): InputCheck {
   const dryRun = checkBoolean('dry_run', raw.dryRun);
   const provenance = checkBoolean('provenance', raw.provenance);
   const loadCredential = checkBoolean('load_credential', raw.loadCredential);
+  const oidc = checkBoolean('oidc', raw.oidc);
   const access = checkAccess(raw.access);
   const tag = checkTag(raw.tag);
   const publishVersion = checkPublishVersion(raw.publishVersion);
   const registryUrl = checkRegistryUrl(raw.registryUrl, dryRun);
-  const { mode, notices } = checkAuthMode(raw, dryRun, loadCredential);
+  const { mode, notices } = checkAuthMode(raw, dryRun, loadCredential, oidc);
+  // npm attaches provenance by itself under trusted publishing, where it
+  // supports doing so, and refuses explicit provenance for a restricted
+  // package. The combination signals a misunderstanding rather than a
+  // harmless overlap.
+  if (oidc && provenance) {
+    throw new InputError(
+      'provenance conflicts with oidc. Trusted publishing does not take ' +
+        'the --provenance flag; npm attaches provenance by itself where it ' +
+        "supports it (public package, public repository). Leave provenance at 'false'",
+    );
+  }
   checkNodeVersion(raw.nodeVersion, raw.nodeVersionFile);
   return {
     inputs: {
