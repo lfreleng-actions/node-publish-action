@@ -860,88 +860,6 @@ jobs:
           echo "nexus_user accepted alongside token auth ✅" \
             >> "$GITHUB_STEP_SUMMARY"
 
-      # Accepting the username is only half the contract. The action
-      # also promises to *say* it had no effect, and callers that
-      # compute nexus_user across a mixed Nexus/npmjs matrix rely on
-      # that notice to tell the two legs apart. Nothing above asserts
-      # it, so deleting the notice would leave CI green.
-      #
-      # The validate step body is extracted from action.yaml and run
-      # directly: a composite action's own log lines are not
-      # available to a later step, so the notice cannot be observed
-      # from the invocations above.
-      - name: "Verify nexus_user is reported as ignored"
-        shell: bash
-        run: |
-          # Verify nexus_user is reported as ignored
-          validate="${RUNNER_TEMP}/validate.sh"
-          python3 -c "import yaml,sys; \
-            d=yaml.safe_load(open('action.yaml')); \
-            m=[x for x in d['runs']['steps'] \
-               if x.get('name') == 'Validate inputs']; \
-            sys.exit('validate step not found') if not m \
-            else sys.stdout.write(m[0]['run'])" > "${validate}"
-          # Fail loudly rather than silently testing nothing if the
-          # step is renamed
-          if ! grep -q 'conflicting authentication modes' \
-            "${validate}"; then
-            echo "Could not extract the validate step ❌"
-            echo "Update the extraction in this job to match"
-            exit 1
-          fi
-          root="${RUNNER_TEMP}/noticetest"
-          rm -rf "${root}"
-          mkdir -p "${root}/proj"
-          printf '%s\n' \
-            '{"name": "notice-fixture", "version": "1.0.0"}' \
-            > "${root}/proj/package.json"
-          # $1 nexus_user, $2 nexus_password, $3 auth_token
-          run_validate() {
-            env \
-              GITHUB_WORKSPACE="${root}" \
-              GITHUB_OUTPUT="${root}/gh_output" \
-              INPUT_PUBLISH_VERSION='1.0.0' \
-              INPUT_REGISTRY_URL='https://registry.npmjs.org/' \
-              INPUT_DRY_RUN='false' \
-              INPUT_PATH_PREFIX='proj' \
-              INPUT_NODE_VERSION='22' \
-              INPUT_NODE_VERSION_FILE='' \
-              INPUT_TAG='latest' \
-              INPUT_ACCESS='' \
-              INPUT_PROVENANCE='false' \
-              INPUT_LOAD_CREDENTIAL='false' \
-              INPUT_NEXUS_USER="$1" \
-              INPUT_NEXUS_PASSWORD="$2" \
-              INPUT_AUTH_TOKEN="$3" \
-              INPUT_VAULT_MAPPING_JSON='' \
-              INPUT_OP_SERVICE_ACCOUNT_TOKEN='' \
-              bash "${validate}" 2>&1
-          }
-          errors=0
-          # Token auth carries no username, so the notice must fire
-          if ! run_validate 'testuser' '' 'npm_testTOKEN0123' \
-            | grep -q '::notice::Ignoring nexus_user'; then
-            echo "No notice for nexus_user alongside token auth ❌"
-            errors=1
-          fi
-          # Basic auth uses the username, so the notice must not
-          # fire. Without this half a notice emitted unconditionally
-          # would pass, while telling Nexus callers their username
-          # was discarded.
-          if run_validate 'testuser' 'testpass' '' \
-            | grep -q 'Ignoring nexus_user'; then
-            echo "nexus_user reported as ignored under Basic auth ❌"
-            errors=1
-          fi
-          if [ "${errors}" != "0" ]; then
-            echo "nexus_user notice tests failed ❌" \
-              >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
-          echo "nexus_user reported as ignored, and only when it is ✅"
-          echo "nexus_user reported as ignored, and only when it is ✅" \
-            >> "$GITHUB_STEP_SUMMARY"
-
       - name: "Verify every invalid combination was rejected"
         shell: bash
         env:
@@ -1371,168 +1289,6 @@ jobs:
           echo "Pre-packed tarball published, stamp skipped ✅" \
             >> "$GITHUB_STEP_SUMMARY"
 
-      # The rejections run against the shipped validate step rather
-      # than a copy, so renaming or reordering it fails loudly here
-      # instead of silently testing nothing.
-      - name: "Exercise every tarball_path rejection"
-        shell: bash
-        run: |
-          # Exercise every tarball_path rejection
-          validate="${RUNNER_TEMP}/validate.sh"
-          python3 - <<'EXTRACT' > "${validate}"
-          import sys
-          import yaml
-
-          with open('action.yaml') as handle:
-              doc = yaml.safe_load(handle)
-          steps = doc['runs']['steps']
-          match = [s for s in steps if s.get('id') == 'validate']
-          if not match:
-              sys.exit("no step with id 'validate' in action.yaml")
-          sys.stdout.write(match[0]['run'])
-          EXTRACT
-          if ! grep -q 'INPUT_TARBALL_PATH' "${validate}"; then
-            echo "Could not extract the validate step ❌"
-            echo "Update the extraction in this job to match"
-            exit 1
-          fi
-
-          mkdir -p "${GITHUB_WORKSPACE}/tbcase"
-          cp packed-package-3.2.1.tgz "${GITHUB_WORKSPACE}/tbcase/ok.tgz"
-          cp packed-package-3.2.1.tgz "${GITHUB_WORKSPACE}/tbcase/wrong.txt"
-          printf 'not a tarball' > "${GITHUB_WORKSPACE}/tbcase/broken.tgz"
-          # An archive whose package.json is not valid JSON, and one
-          # whose manifest parses but declares no version. Both reach
-          # branches no other case covers.
-          mkdir -p "${RUNNER_TEMP}/bad/package"
-          printf '{ not json' \
-            > "${RUNNER_TEMP}/bad/package/package.json"
-          tar -czf "${GITHUB_WORKSPACE}/tbcase/badjson.tgz" \
-            -C "${RUNNER_TEMP}/bad" package
-          mkdir -p "${RUNNER_TEMP}/nover/package"
-          printf '{"name":"no-version"}' \
-            > "${RUNNER_TEMP}/nover/package/package.json"
-          tar -czf "${GITHUB_WORKSPACE}/tbcase/noversion.tgz" \
-            -C "${RUNNER_TEMP}/nover" package
-          mkdir -p "${GITHUB_WORKSPACE}/tbcase/adir"
-          # A directory whose name ends in .tgz clears the extension
-          # check, so only the file-type test can reject it. Without
-          # this case that test is dead weight, and the failure it
-          # prevents -- tar reporting a confusing error on a directory
-          # -- would reach the caller instead.
-          mkdir -p "${GITHUB_WORKSPACE}/tbcase/dir.tgz"
-          # A real file outside the workspace, so the boundary check is
-          # what rejects it rather than the path failing to resolve
-          outside="$(mktemp -d)"
-          cp packed-package-3.2.1.tgz "${outside}/escape.tgz"
-          ln -sf "${outside}/escape.tgz" \
-            "${GITHUB_WORKSPACE}/tbcase/symlink.tgz"
-
-          # The runner invokes a 'shell: bash' step as
-          # 'bash --noprofile --norc -eo pipefail', so the extracted
-          # step runs the same way below. Plain 'bash' would drop
-          # pipefail and let this job disagree with CI about whether a
-          # pipeline inside the step failed.
-          errors=0
-          # $1 label, $2 tarball_path, $3 publish_version, $4 want,
-          # $5 optional substring the rejection message must contain
-          check() {
-            local label="$1" path="$2" version="$3" want="$4"
-            local want_msg="${5:-}"
-            set +e
-            out="$(env \
-              INPUT_PUBLISH_VERSION="${version}" INPUT_REGISTRY_URL='' \
-              INPUT_DRY_RUN=true INPUT_PATH_PREFIX=project \
-              INPUT_TARBALL_PATH="${path}" INPUT_NODE_VERSION=22 \
-              INPUT_NODE_VERSION_FILE='' INPUT_TAG=latest \
-              INPUT_ACCESS='' INPUT_PROVENANCE=false \
-              INPUT_LOAD_CREDENTIAL=false INPUT_NEXUS_USER='' \
-              INPUT_NEXUS_PASSWORD='' INPUT_AUTH_TOKEN='' \
-              INPUT_VAULT_MAPPING_JSON='' \
-              INPUT_OP_SERVICE_ACCOUNT_TOKEN='' \
-              GITHUB_OUTPUT="${RUNNER_TEMP}/tbout.txt" \
-              bash --noprofile --norc -eo pipefail "${validate}" 2>&1)"
-            rc=$?
-            set -e
-            if [ "${want}" = 'accept' ]; then
-              if [ "${rc}" != "0" ]; then
-                echo "${label}: expected acceptance, got rc=${rc} ❌"
-                printf '%s\n' "${out}" | tail -3
-                errors=1
-              fi
-              return
-            fi
-            if [ "${rc}" = "0" ]; then
-              echo "${label}: expected rejection, validate passed ❌"
-              errors=1
-              return
-            fi
-            if ! printf '%s' "${out}" | grep -q '❌'; then
-              echo "${label}: rejected without a labelled error ❌"
-              errors=1
-            fi
-            # Several checks reject the same input, so a bare rejection
-            # does not show which one fired. Where the message matters,
-            # assert it: otherwise the earlier, clearer check can be
-            # deleted and every case still passes.
-            if [ -n "${want_msg}" ] \
-              && ! printf '%s' "${out}" | grep -qF "${want_msg}"; then
-              echo "${label}: expected message '${want_msg}' ❌"
-              printf '%s\n' "${out}" | tail -3
-              errors=1
-            fi
-          }
-
-          : > "${RUNNER_TEMP}/tbout.txt"
-          check 'valid tarball' 'tbcase/ok.tgz' '3.2.1' accept
-          check 'version mismatch' 'tbcase/ok.tgz' '9.9.9' reject
-          check 'wrong extension' 'tbcase/wrong.txt' '3.2.1' reject
-          check 'missing file' 'tbcase/nope.tgz' '3.2.1' reject
-          check 'directory' 'tbcase/adir' '3.2.1' reject \
-            'tarball_path is not a file'
-          check 'directory named .tgz' 'tbcase/dir.tgz' '3.2.1' reject \
-            'tarball_path is not a file'
-          check 'not an npm archive' 'tbcase/broken.tgz' '3.2.1' reject \
-            'cannot read package.json from the tarball'
-          check 'manifest is not JSON' 'tbcase/badjson.tgz' '3.2.1' \
-            reject 'not valid'
-          check 'manifest has no version' 'tbcase/noversion.tgz' '3.2.1' \
-            reject 'declares no version'
-          check 'absolute escape' "${outside}/escape.tgz" '3.2.1' reject
-          check 'relative escape' '../escape.tgz' '3.2.1' reject
-          check 'symlink escape' 'tbcase/symlink.tgz' '3.2.1' reject
-          # A value ending in a newline must be refused on the raw
-          # input. realpath's output loses trailing newlines, so were
-          # this checked after resolving, the value would silently
-          # become the newline-free sibling -- validating one file and
-          # publishing another.
-          #
-          # Built with $'...' rather than "$(printf ...)", because
-          # command substitution strips the very newline under test.
-          # The message assertion is what gives this teeth: without
-          # the check the path merely fails to resolve, which is a
-          # different error and would otherwise look like a pass.
-          newline_path=$'tbcase/ok.tgz\n'
-          check 'trailing newline' "${newline_path}" '3.2.1' reject \
-            'line break'
-          # Empty keeps the packing path, and must not emit a tarball
-          check 'empty means pack' '' '3.2.1' accept
-          resolved="$(grep '^tarball=' "${RUNNER_TEMP}/tbout.txt" \
-            | tail -1 | cut -d= -f2-)"
-          if [ -n "${resolved}" ]; then
-            echo "Empty tarball_path resolved to '${resolved}' ❌"
-            errors=1
-          fi
-
-          if [ "${errors}" != "0" ]; then
-            echo "tarball_path rejection tests failed ❌" \
-              >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
-          echo "Every tarball_path rejection behaved ✅"
-          echo "Every tarball_path rejection behaved ✅" \
-            >> "$GITHUB_STEP_SUMMARY"
-
   test-scoped-registry:
     name: "Test: scoped registry overrides"
     runs-on: ubuntu-latest
@@ -1575,7 +1331,7 @@ jobs:
         shell: bash
         run: |
           # Resolve against real npm configuration
-          resolver="${GITHUB_WORKSPACE}/dist/resolve-registry/index.js"
+          resolver="${GITHUB_WORKSPACE}/dist/prepare/index.js"
           input='https://nexus3.example.org/repository/npm.release/'
           scoped='https://scoped.example.org/repo/'
           manifest='https://from-manifest.example.org/'
@@ -1583,13 +1339,21 @@ jobs:
 
           # $1 label, $2 expected registry, $3 expected source,
           # $4 expected scope ('' for an unscoped package)
+          #
+          # The project lives under RUNNER_TEMP, so that is the workspace
+          # the bundle confines it to. A dry run needs no credential, which
+          # leaves resolution as the only thing that can fail.
           run_case() {
             local label="$1" want="$2" want_source="$3" want_scope="${4:-}"
             local out="${RUNNER_TEMP}/case-out.txt"
             : > "${out}"
             set +e
-            log="$(PROJECT_DIR="${RUNNER_TEMP}/proj" REGISTRY_URL="${input}" \
-              TARBALL="${TARBALL:-}" \
+            log="$(GITHUB_WORKSPACE="${RUNNER_TEMP}" \
+              INPUT_PATH_PREFIX=proj INPUT_REGISTRY_URL="${input}" \
+              INPUT_TARBALL_PATH="${TARBALL:-}" \
+              INPUT_PUBLISH_VERSION="${VERSION:-1.0.0}" \
+              INPUT_DRY_RUN=true INPUT_NODE_VERSION=22 INPUT_TAG=latest \
+              INPUT_PROVENANCE=false INPUT_LOAD_CREDENTIAL=false \
               GITHUB_OUTPUT="${out}" node "${resolver}" 2>&1)"
             rc=$?
             set -e
@@ -1670,7 +1434,7 @@ jobs:
           run_case 'scoped ignored when unscoped' "${input}" input ''
 
           # An override arrives from the project's own files, so it gets
-          # the scheme check registry_url received in the validate step.
+          # the scheme check registry_url receives.
           rm -f "${RUNNER_TEMP}/proj/.npmrc"
           write_manifest '{"name":"@onap/ui-common","version":"1.0.0",
             "publishConfig":{"@onap:registry":"http://evil.example/"}}'
@@ -1734,9 +1498,10 @@ jobs:
             && npm pack --pack-destination "${RUNNER_TEMP}" \
               >/dev/null 2>&1 )
           export TARBALL="${RUNNER_TEMP}/onap-from-tarball-9.9.9.tgz"
+          export VERSION=9.9.9
           run_case 'tarball manifest wins' \
             'https://from-tarball.example.org/' publishConfig-scoped '@onap'
-          unset TARBALL
+          unset TARBALL VERSION
 
           if [ "${errors}" != "0" ]; then
             echo "Scoped registry resolution failed ❌" \
@@ -1764,23 +1529,24 @@ jobs:
               steps = yaml.safe_load(handle)['runs']['steps']
 
           by_id = {s.get('id'): s for s in steps if s.get('id')}
-          resolved = '${' + '{ steps.registry.outputs.registry }' + '}'
+          resolved = '${' + '{ steps.prepare.outputs.registry }' + '}'
           errors = []
 
-          if 'registry' not in by_id:
-              errors.append("no step with id 'registry' in action.yaml")
+          if 'prepare' not in by_id:
+              errors.append("no step with id 'prepare' in action.yaml")
 
           # The publish and verify steps must read the resolved value.
-          # The resolve step itself must keep reading the raw input,
+          # The prepare step itself must keep reading the raw input,
           # since it is the thing being resolved -- pointing it at its
           # own output would be a silent no-op.
           resolved_scopes = (
-              '${' + '{ steps.registry.outputs.registry_scopes }' + '}'
+              '${' + '{ steps.prepare.outputs.registry_scopes }' + '}'
           )
           expectations = {
-              'registry': ('${' + '{ inputs.registry_url }' + '}',
-                           'the caller input it resolves'),
-              'publish': (resolved, 'the resolved registry'),
+              'prepare': ('INPUT_REGISTRY_URL',
+                          '${' + '{ inputs.registry_url }' + '}',
+                          'the caller input it resolves'),
+              'publish': ('REGISTRY_URL', resolved, 'the resolved registry'),
           }
           # The scope-pin loop is a no-op without this, and the dry-run
           # fixture would still pass because its manifest already selects
@@ -1796,15 +1562,15 @@ jobs:
                   f'expected {resolved_scopes!r}; the pin loop would '
                   'iterate nothing'
               )
-          for step_id, (want, description) in expectations.items():
+          for step_id, (variable, want, description) in expectations.items():
               step = by_id.get(step_id)
               if step is None:
                   errors.append(f"no step with id '{step_id}'")
                   continue
-              got = str((step.get('env') or {}).get('REGISTRY_URL', '')).strip()
+              got = str((step.get('env') or {}).get(variable, '')).strip()
               if got != want:
                   errors.append(
-                      f"step '{step_id}' REGISTRY_URL is {got!r}, expected "
+                      f"step '{step_id}' {variable} is {got!r}, expected "
                       f'{want!r} ({description})'
                   )
 
@@ -1843,7 +1609,7 @@ jobs:
                   (verify[0].get('env') or {}).get('REGISTRY_SCOPES', '')
               ).strip()
               want_scope = (
-                  '${' + '{ steps.registry.outputs.registry_scopes }' + '}'
+                  '${' + '{ steps.prepare.outputs.registry_scopes }' + '}'
               )
               if scope_env != want_scope:
                   errors.append(
@@ -1881,30 +1647,28 @@ jobs:
                   'redirect the publish after resolution'
               )
 
-          # The resolve step now runs the first bundled program, so it
+          # The prepare step runs the first bundled program, so it
           # carries the runtime guard. Without it an old node_version
           # produces a raw module error instead of naming the input to
           # raise -- and no other check here would notice, because the
           # runners CI uses are new enough to load the bundle.
-          registry_body = str(by_id.get('registry', {}).get('run', ''))
-          if '--selftest' not in registry_body:
+          prepare_body = str(by_id.get('prepare', {}).get('run', ''))
+          if '--selftest' not in prepare_body:
               errors.append(
-                  'the resolve step does not self-test the bundle before '
+                  'the prepare step does not self-test the bundle before '
                   'using it; an unsupported node_version would fail with '
                   'a raw module error'
               )
 
-          # Validation stages the archive outside the workspace, and
-          # every step that opens it must use that copy. Reverting one
-          # to the workspace path reopens the substitution window, and
-          # nothing else here would notice: the publish still succeeds.
-          for step_id in ('registry', 'publish'):
-              body = str(by_id.get(step_id, {}).get('run', ''))
-              if '"${RUNNER_TEMP:?}"/*' not in body:
-                  errors.append(
-                      f"step '{step_id}' does not require the staged "
-                      'tarball; it would reopen the mutable workspace path'
-                  )
+          # Prepare stages the archive outside the workspace, and the
+          # publish step must use that copy. Reverting it to the
+          # workspace path reopens the substitution window, and nothing
+          # else here would notice: the publish still succeeds.
+          if '"${RUNNER_TEMP:?}"/*' not in publish_body:
+              errors.append(
+                  "step 'publish' does not require the staged tarball; "
+                  'it would reopen the mutable workspace path'
+              )
 
           # Resolution must precede the .npmrc step, which replaces the
           # project's own file. Resolving afterwards would read this
@@ -1913,7 +1677,9 @@ jobs:
           # a 401 that no test here would otherwise catch.
           names = [str(s.get('name', '')) for s in steps]
           try:
-              resolve_at = names.index('Resolve the effective registry')
+              resolve_at = names.index(
+                  'Validate inputs and resolve the registry'
+              )
               npmrc_at = names.index('Create authenticated .npmrc')
           except ValueError:
               errors.append('cannot find the resolve and .npmrc steps')

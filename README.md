@@ -50,8 +50,7 @@ steps:
 
 ## Requirements
 
-The action needs `jq`, `realpath` (GNU coreutils, including `-m`
-support), `mktemp`, `tr`, `tar` and `cp` on the runner.
+The action needs `jq`, `realpath`, `mktemp` and `tr` on the runner.
 GitHub-hosted Ubuntu runners include these tools; minimal self-hosted
 or non-Linux runners
 must provide them. The action checks for them up front and fails with
@@ -132,16 +131,19 @@ The `nexus_user`, `scope` and credential inputs pass through to
 
 ## Behaviour
 
-1. **Check inputs**: tests every input against its allowlist; real
-   publishes need `registry_url` and a credential source as well,
-   failing fast with a clear error otherwise. With
-   `load_credential: 'true'`, real publishes need non-empty
-   `vault_mapping_json` and `op_service_account_token` values too
-2. **Resolve the registry**: works out where npm will actually publish,
-   which a scoped package can redirect away from `registry_url`. See
+1. **Set up Node.js**: `actions/setup-node` installs the version
+   `node_version` or `node_version_file` selects. Everything after it
+   runs on that Node.js and its npm, including the action's own checks
+2. **Check inputs and resolve the registry**: tests every input
+   against its allowlist; real publishes need `registry_url` and a
+   credential source as well, failing fast with a clear error
+   otherwise. With `load_credential: 'true'`, real publishes need
+   non-empty `vault_mapping_json` and `op_service_account_token`
+   values too. Then works out where npm will actually publish, which
+   a scoped package can redirect away from `registry_url`. See
    [Effective Registry](#effective-registry). This runs before
-   authentication because the next step replaces the project's `.npmrc`,
-   one of the files resolution reads
+   authentication because the next step replaces the project's
+   `.npmrc`, one of the files resolution reads
 3. **Authenticate** (real publishes): `node-create-npmrc-action`
    writes an authenticated `.npmrc` into the project directory, keyed
    to the resolved registry
@@ -428,9 +430,12 @@ Three consequences follow from the tarball being the artefact:
 - **The action skips the version stamp.** The archive already carries
   its version, and rewriting the working tree would change a manifest
   nothing reads. The action instead reads the version out of the
-  tarball and requires it to equal `publish_version`, so a stale
-  archive cannot publish under a version the caller never asked for.
-  Validation copies the archive into `RUNNER_TEMP` **before** reading
+  tarball, with the publishing npm's own manifest reader, and requires
+  it to equal `publish_version`, so a stale archive cannot publish
+  under a version the caller never asked for. Because the reader is
+  npm's, the version compared is the one npm sends: a `v1.2.3` in the
+  archive publishes as `1.2.3`, and matches that request.
+  The action copies the archive into `RUNNER_TEMP` **before** reading
   it, validates the copy, and every later step uses that copy; a
   final `always()` step removes it. No check around a read of the
   workspace path could be atomic with that read, so the action moves
