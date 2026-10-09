@@ -50,14 +50,12 @@ steps:
 
 ## Requirements
 
-The action needs `jq`, `realpath`, `mktemp` and `tr` on the runner.
-GitHub-hosted Ubuntu runners include these tools; minimal self-hosted
-or non-Linux runners
-must provide them. The action checks for them up front and fails with
-a clear error naming any missing tool. It installs Node.js and npm via
-the pinned `actions/setup-node` action, without dependency caching.
-Real publishes need egress to the target registry; dry-run mode
-publishes nothing and writes no credential.
+The action needs no tools on the runner beyond `bash` and what
+`actions/setup-node` installs: every check and every npm invocation
+runs in its own bundled programs on the selected Node.js. It installs
+Node.js and npm via the pinned `actions/setup-node` action, without
+dependency caching. Real publishes need egress to the target
+registry; dry-run mode publishes nothing and writes no credential.
 
 The action needs **npm 8 or later**, the npm that `node_version`
 selects, and fails with a clear error on anything older. It resolves
@@ -167,6 +165,15 @@ The `nexus_user`, `scope` and credential inputs pass through to
    or index asynchronously), while a readable package with the wrong
    version fails the action
 
+Steps 4 to 6 run as one program. The checking step records every
+decision in a state file in a private directory under `RUNNER_TEMP`,
+outside the checked-out tree, and the publish reads that file alone,
+checked against one schema. It runs npm as the same npm whose code
+resolved the registry, refusing to publish if `PATH` now names a
+different one, and re-checks the project directory before stamping
+and again before verifying, since lifecycle scripts run between them.
+An `always()` step removes the directory at the end.
+
 ## Publish Output Parsing
 
 npm runs lifecycle scripts with inherited stdio, so whatever
@@ -183,10 +190,18 @@ generation's layout. npm 10 placed those at the top level; npm 11
 keys the object by package name.
 
 If npm's exit status is non-zero, the action reports a publish
-failure. If npm **succeeded** and the action still cannot read the
-metadata, it says so explicitly and states that the package reached
-the registry, because retrying that publish cannot succeed — it fails
-with `EPUBLISHCONFLICT` on a version that the registry already holds.
+failure — unless npm's output already reports the requested version as
+published. npm prints that report once the registry has accepted the
+upload and not before, and from npm 10 before the `publish` and
+`postpublish` scripts run, so a failing script can follow a completed
+publish. The action then says the package has probably reached the
+registry and to check it before retrying.
+
+If npm **succeeded** and the action still cannot read the metadata, it
+says so explicitly and states that the package reached the registry,
+because retrying that publish cannot succeed — it fails with
+`EPUBLISHCONFLICT` on a version that the registry already holds. The
+same applies when verification reads back a different version.
 
 > [!NOTE]
 > The action tolerates hooks that print to stdout, but stdout is the
@@ -252,7 +267,7 @@ verifies and reports a single package.
 To publish more than one workspace package, call the action once per
 package with its own `path_prefix`.
 
-A workspace selected through `npm_config_workspace` fails validation.
+A workspace selected through `npm_config_workspace` fails the input checks.
 One selected through a `workspace=` entry in an `.npmrc` fails at the
 stamp instead, before anything reaches the registry: npm exposes such
 a selection through neither `npm config get workspace` nor `npm config
@@ -436,7 +451,7 @@ Three consequences follow from the tarball being the artefact:
   npm's, the version compared is the one npm sends: a `v1.2.3` in the
   archive publishes as `1.2.3`, and matches that request.
   The action copies the archive into `RUNNER_TEMP` **before** reading
-  it, validates the copy, and every later step uses that copy; a
+  it, validates the copy, and the publish uses that copy; a
   final `always()` step removes it. No check around a read of the
   workspace path could be atomic with that read, so the action moves
   the bytes outside the checked-out tree first — the version, identity
@@ -461,8 +476,9 @@ Relative values for `path_prefix` resolve against `GITHUB_WORKSPACE`,
 not the current working directory, so behaviour stays deterministic
 when a calling workflow sets a custom working directory. The project
 directory must resolve within `GITHUB_WORKSPACE` and contain a
-`package.json`; the boundary check re-runs in every later step that
-touches the path. Paths that escape the workspace fail the action.
+`package.json`. The publish re-checks that it still resolves to the
+same place before stamping and again before verifying. Paths that
+escape the workspace fail the action.
 
 ## Notes
 
@@ -493,8 +509,10 @@ touches the path. Paths that escape the workspace fail the action.
 
 The action remains a composite action, so it can call
 `actions/setup-node` to select the Node.js version the publish runs
-under. Logic that needs real testing lives in TypeScript under `src/`
-and runs as a small Node program invoked from `action.yaml`.
+under. Every step after that runs one of two bundled TypeScript
+programs: `dist/prepare` checks the inputs and resolves the registry,
+and `dist/publish` stamps, publishes and verifies. Their logic lives
+under `src/` as functions with unit tests.
 
 ```bash
 npm ci          # install the toolchain
@@ -520,11 +538,11 @@ Two different Node.js floors apply, and they are not the same number:
   (`^20.19.0 || ^22.13.0 || >=24`), the range ESLint, vitest and vite
   all support. It governs
   `npm ci` and the commands above
-- **The bundle** targets `node18`, because it runs on whatever
-  `node_version` selected for the publish rather than on the toolchain.
-  The publish step runs it with `--selftest` ahead of npm, so a runtime
-  too old to load it fails the run while nothing has yet reached the
-  registry
+- **The bundles** target `node18`, because they run on whatever
+  `node_version` selected for the publish rather than on the
+  toolchain. Each step runs its bundle with `--selftest` first, so a
+  runtime too old to load it fails the run while nothing has yet
+  reached the registry
 
 The repository **commits** `dist/`. GitHub runs an action straight
 from the repository and offers no build step, so the bundle has to be

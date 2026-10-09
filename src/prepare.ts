@@ -33,11 +33,11 @@ import {
 } from './npm-internals.js';
 import { publishFlags } from './publish-options.js';
 import { assertSupportedNpm, resolveEffectiveRegistry, type RegistryResolution } from './registry.js';
+import { makeWorkDir, removeWorkDir, writeState } from './state.js';
 import {
   confineNodeVersionFile,
   confineProject,
   printable,
-  removeStaged,
   resolveTarball,
   runnerDirs,
   stageTarball,
@@ -47,11 +47,13 @@ export interface PrepareResult {
   readonly inputs: CheckedInputs;
   /** The resolved project directory. */
   readonly projectDir: string;
-  /** The staged archive in RUNNER_TEMP, or '' when packing the project. */
+  /** The staged archive in the work directory, or '' when packing the project. */
   readonly tarball: string;
   readonly resolution: RegistryResolution;
   /** The npm whose code made the decisions. */
   readonly npmVersion: string;
+  /** The state file the publish step reads. */
+  readonly statePath: string;
   /** Notices to emit: accepted, but worth saying. */
   readonly notices: readonly string[];
 }
@@ -139,8 +141,9 @@ export async function prepare(
   const internals = load();
   const config = await loadConfig(internals, projectDir, inputs.registryUrl, env);
 
-  const tarball = source === '' ? '' : stageTarball(source, dirs.runnerTemp);
+  const workDir = makeWorkDir(dirs.runnerTemp);
   try {
+    const tarball = source === '' ? '' : stageTarball(source, workDir);
     // The manifest npm will publish. For a tarball that is the one *inside
     // the archive*, not the working directory's: its scope and
     // publishConfig decide the registry, and its version is what ships.
@@ -165,11 +168,33 @@ export async function prepare(
       npmVersion: internals.npmVersion,
       pickRegistry: internals.pickRegistry,
     });
-    return { inputs, projectDir, tarball, resolution, npmVersion: internals.npmVersion, notices };
+    const statePath = writeState(workDir, {
+      schema: 1,
+      npmVersion: internals.npmVersion,
+      npmDir: internals.npmDir,
+      projectDir,
+      tarball,
+      publishVersion: inputs.publishVersion,
+      dryRun: inputs.dryRun,
+      tag: inputs.tag,
+      access: inputs.access,
+      provenance: inputs.provenance,
+      registry: resolution.registry,
+      scopes: resolution.scopes,
+    });
+    return {
+      inputs,
+      projectDir,
+      tarball,
+      resolution,
+      npmVersion: internals.npmVersion,
+      statePath,
+      notices,
+    };
   } catch (cause) {
-    // The cleanup step keys off this step's tarball output, which a
-    // failure never writes, so the staged copy is removed here.
-    if (tarball !== '') removeStaged(tarball);
+    // The cleanup step keys off this step's state output, which a failure
+    // never writes, so the work directory is removed here.
+    removeWorkDir(workDir);
     throw cause;
   }
 }
