@@ -590,6 +590,14 @@ jobs:
             '{"name": "token-project", "version": "1.0.0"}' \
             > token-project/package.json
           jq -e . token-project/package.json > /dev/null
+          # Fixture for the OIDC grant case, whose assertion is that
+          # nothing stamped it
+          mkdir -p oidc-project
+          printf '%s\n' \
+            '{"name": "lfreleng-node-publish-action-oidc-fixture",' \
+            ' "version": "1.0.0"}' \
+            > oidc-project/package.json
+          jq -e . oidc-project/package.json > /dev/null
 
       # Ambiguous credentials must fail rather than silently pick one.
       # The token below is a test literal, not a real credential.
@@ -631,6 +639,80 @@ jobs:
           auth_token: 'npm_testTOKEN0123456789abcdefGHIJKLM'
           load_credential: 'true'
           dry_run: 'true'
+
+      # OIDC is the third mode, exclusive with both others. As above,
+      # these run in dry-run mode, and on Node.js 24, whose npm clears
+      # the trusted-publishing floor -- so a missing exclusivity check
+      # would let each of them succeed rather than fail for some
+      # unrelated reason.
+      - name: "OIDC plus token [expected failure]"
+        id: oidc-and-token
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: auth-project
+          publish_version: '1.0.0'
+          registry_url: 'https://registry.npmjs.org/'
+          node_version: '24'
+          oidc: 'true'
+          auth_token: 'npm_testTOKEN0123456789abcdefGHIJKLM'
+          dry_run: 'true'
+
+      - name: "OIDC plus password [expected failure]"
+        id: oidc-and-password
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: auth-project
+          publish_version: '1.0.0'
+          registry_url: 'https://registry.npmjs.org/'
+          node_version: '24'
+          oidc: 'true'
+          nexus_password: 'testpass'
+          dry_run: 'true'
+
+      - name: "OIDC plus load_credential [expected failure]"
+        id: oidc-and-load
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: auth-project
+          publish_version: '1.0.0'
+          registry_url: 'https://registry.npmjs.org/'
+          node_version: '24'
+          oidc: 'true'
+          load_credential: 'true'
+          dry_run: 'true'
+
+      # npm attaches provenance itself under trusted publishing, and
+      # refuses the explicit flag for a restricted package.
+      - name: "OIDC plus provenance [expected failure]"
+        id: oidc-and-provenance
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: auth-project
+          publish_version: '1.0.0'
+          registry_url: 'https://registry.npmjs.org/'
+          node_version: '24'
+          oidc: 'true'
+          provenance: 'true'
+          dry_run: 'true'
+
+      # This job holds no id-token grant, so a real trusted publish has
+      # no token endpoint and must stop before stamping. Without the
+      # check it would stamp, then fail at npm for want of a credential
+      # -- so the untouched fixture is what discriminates.
+      - name: "OIDC without the id-token grant [expected failure]"
+        id: oidc-no-grant
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: oidc-project
+          publish_version: '2.0.0'
+          registry_url: 'https://registry.npmjs.org/'
+          node_version: '24'
+          oidc: 'true'
 
       # Every other auth_token case is rejected during validation, so
       # nothing exercises the pass-through to node-create-npmrc-action
@@ -719,12 +801,22 @@ jobs:
         env:
           TOKEN_AND_PASSWORD: ${{ steps.token-and-password.outcome }}
           TOKEN_AND_LOAD: ${{ steps.token-and-load.outcome }}
+          OIDC_AND_TOKEN: ${{ steps.oidc-and-token.outcome }}
+          OIDC_AND_PASSWORD: ${{ steps.oidc-and-password.outcome }}
+          OIDC_AND_LOAD: ${{ steps.oidc-and-load.outcome }}
+          OIDC_AND_PROVENANCE: ${{ steps.oidc-and-provenance.outcome }}
+          OIDC_NO_GRANT: ${{ steps.oidc-no-grant.outcome }}
         run: |
           # Verify every invalid combination was rejected
           errors=0
           for pair in \
             "token+password:${TOKEN_AND_PASSWORD}" \
-            "token+load_credential:${TOKEN_AND_LOAD}"; do
+            "token+load_credential:${TOKEN_AND_LOAD}" \
+            "oidc+token:${OIDC_AND_TOKEN}" \
+            "oidc+password:${OIDC_AND_PASSWORD}" \
+            "oidc+load_credential:${OIDC_AND_LOAD}" \
+            "oidc+provenance:${OIDC_AND_PROVENANCE}" \
+            "oidc without id-token:${OIDC_NO_GRANT}"; do
             name="${pair%%:*}"
             outcome="${pair##*:}"
             if [ "${outcome}" != "failure" ]; then
@@ -732,6 +824,11 @@ jobs:
               errors=1
             fi
           done
+          stamped="$(jq -r '.version // empty' oidc-project/package.json)"
+          if [ "${stamped}" != "1.0.0" ]; then
+            echo "OIDC without a grant got as far as the stamp ❌"
+            errors=1
+          fi
           if [ "${errors}" != "0" ]; then
             echo "Authentication mode tests failed ❌" \
               >> "$GITHUB_STEP_SUMMARY"
@@ -739,6 +836,232 @@ jobs:
           fi
           echo "Invalid authentication modes correctly rejected ✅"
           echo "Invalid authentication modes correctly rejected ✅" \
+            >> "$GITHUB_STEP_SUMMARY"
+
+  ### Test the trusted-publishing toolchain floor ###
+  # OIDC needs npm >= 11.5.2 and Node.js >= 22.14.0, and meeting the Node
+  # floor does not meet the npm one: Node 22.14.0 bundles npm 10.9.2. The
+  # unit tests cover the comparison; this shows the action applies it to
+  # the npm setup-node actually installs, in a dry run, which needs no
+  # grant and is held to the floor all the same.
+  test-oidc-toolchain:
+    name: "Test: OIDC toolchain floor"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      # Load the egress allow-list out-of-band from the
+      # organisation's .github repository and publish it as
+      # $CONNECTION_ALLOW_LIST for the harden-runner step below.
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@a32eb064a1188f6b0f15d2c0c0381efe54b0dd22 # v0.12.2
+        with:
+          config: '@807a544b7e55a9224b2b3780e636467bd4b5b99b' # v0.5.0
+
+      # Harden the runner with the just-loaded allow-list.
+      - name: "Harden runner (block)"
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Create project fixture"
+        shell: bash
+        run: |
+          # Create project fixture
+          mkdir -p floor-project
+          printf '%s\n' \
+            '{"name": "lfreleng-node-publish-action-oidc-floor",' \
+            ' "version": "1.0.0"}' \
+            > floor-project/package.json
+          jq -e . floor-project/package.json > /dev/null
+
+      - name: "OIDC on Node 22.14.0, npm 10 [expected failure]"
+        id: below-floor
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: floor-project
+          publish_version: '1.0.1'
+          registry_url: 'https://registry.npmjs.org/'
+          node_version: '22.14.0'
+          oidc: 'true'
+          dry_run: 'true'
+
+      - name: "OIDC on Node 24 clears the floor"
+        id: meets-floor
+        uses: $/
+        with:
+          path_prefix: floor-project
+          publish_version: '1.0.2'
+          registry_url: 'https://registry.npmjs.org/'
+          node_version: '24'
+          oidc: 'true'
+          dry_run: 'true'
+
+      - name: "Verify the floor rejected and accepted correctly"
+        shell: bash
+        env:
+          BELOW: ${{ steps.below-floor.outcome }}
+          MEETS_VERSION: ${{ steps.meets-floor.outputs.published_version }}
+        run: |
+          # Verify the floor rejected and accepted correctly
+          errors=0
+          if [ "${BELOW}" != "failure" ]; then
+            echo "OIDC on npm 10 was accepted ❌"
+            errors=1
+          fi
+          if [ "${MEETS_VERSION}" != "1.0.2" ]; then
+            echo "OIDC on Node 24 did not complete the dry run ❌"
+            errors=1
+          fi
+          if [ "${errors}" != "0" ]; then
+            echo "OIDC toolchain tests failed ❌" >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "OIDC toolchain floor enforced ✅"
+          echo "OIDC toolchain floor enforced ✅" >> "$GITHUB_STEP_SUMMARY"
+
+  ### Test the OIDC stored-credential guard under a real grant ###
+  # The only job granted id-token: write, so a real trusted publish gets
+  # past the endpoint check and reaches the guard. The unit tests cover
+  # every credential route through npm's own lookup; this shows the
+  # shipped action refuses before stamping, and lets a clean project on.
+  #
+  # Neither case exchanges a token. The shadowed one is refused before
+  # npm runs; the clean one stops at a failing prepublishOnly, which npm
+  # runs before it requests an OIDC token.
+  #
+  # GitHub issues no OIDC token to a pull request from a fork, so the
+  # job detects that and skips rather than report a failure it cannot
+  # avoid. It runs for real on push to main.
+  test-oidc-credential-guard:
+    name: "Test: OIDC stored-credential guard"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write  # reaches the guard; neither case exchanges
+    timeout-minutes: 10
+    steps:
+      # Load the egress allow-list out-of-band from the
+      # organisation's .github repository and publish it as
+      # $CONNECTION_ALLOW_LIST for the harden-runner step below.
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@a32eb064a1188f6b0f15d2c0c0381efe54b0dd22 # v0.12.2
+        with:
+          config: '@807a544b7e55a9224b2b3780e636467bd4b5b99b' # v0.5.0
+
+      # Harden the runner with the just-loaded allow-list.
+      - name: "Harden runner (block)"
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      - name: "Detect OIDC token availability"
+        id: oidc-env
+        shell: bash
+        run: |
+          # Detect OIDC token availability
+          if [ -n "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::No OIDC token endpoint, so the guard is" \
+              "unreachable and this job self-skips. Expected on a" \
+              "pull request from a fork; it runs on push to main."
+          fi
+
+      # The token is a test literal, not a credential.
+      - name: "Create fixtures"
+        if: steps.oidc-env.outputs.available == 'true'
+        shell: bash
+        run: |
+          # Create fixtures
+          mkdir -p shadow-project clean-project
+          printf '%s\n' \
+            '{"name": "lfreleng-node-publish-action-shadow",' \
+            ' "version": "1.0.0"}' \
+            > shadow-project/package.json
+          printf '%s\n' \
+            '//registry.npmjs.org/:_authToken=placeholder-not-a-secret' \
+            > shadow-project/.npmrc
+          cat > clean-project/package.json << 'FIXTURE'
+          {
+            "name": "lfreleng-node-publish-action-clean",
+            "version": "1.0.0",
+            "scripts": {
+              "prepublishOnly": "exit 1"
+            }
+          }
+          FIXTURE
+          printf '%s\n' 'registry=https://registry.npmjs.org/' \
+            > clean-project/.npmrc
+          jq -e . shadow-project/package.json clean-project/package.json \
+            > /dev/null
+
+      - name: "OIDC with a stored credential [expected failure]"
+        id: shadowed
+        if: steps.oidc-env.outputs.available == 'true'
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: shadow-project
+          publish_version: '8.8.8'
+          registry_url: 'https://registry.npmjs.org/'
+          node_version: '24'
+          oidc: 'true'
+
+      - name: "OIDC with registry-only configuration [clears the guard]"
+        id: unshadowed
+        if: steps.oidc-env.outputs.available == 'true'
+        continue-on-error: true
+        uses: $/
+        with:
+          path_prefix: clean-project
+          publish_version: '8.8.8'
+          registry_url: 'https://registry.npmjs.org/'
+          node_version: '24'
+          oidc: 'true'
+
+      - name: "Verify the guard rejected only the shadowed fixture"
+        if: steps.oidc-env.outputs.available == 'true'
+        shell: bash
+        env:
+          SHADOWED: ${{ steps.shadowed.outcome }}
+        run: |
+          # Verify the guard rejected only the shadowed fixture
+          errors=0
+          if [ "${SHADOWED}" != "failure" ]; then
+            echo "Stored credential was not rejected ❌"
+            errors=1
+          fi
+          # The guard runs in the prepare step, so an untouched version
+          # proves it fired before any publish was attempted.
+          shadow="$(jq -r '.version // empty' shadow-project/package.json)"
+          if [ "${shadow}" != "1.0.0" ]; then
+            echo "Guard fired late: package.json was stamped ❌"
+            errors=1
+          fi
+          # The clean fixture still fails, at its prepublishOnly, so
+          # assert on the stamp, which only a cleared guard reaches.
+          clean="$(jq -r '.version // empty' clean-project/package.json)"
+          if [ "${clean}" != "8.8.8" ]; then
+            echo "Registry-only configuration was rejected ❌"
+            errors=1
+          fi
+          if [ "${errors}" != "0" ]; then
+            echo "OIDC credential guard tests failed ❌" \
+              >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+          echo "OIDC credential guard behaved correctly ✅"
+          echo "OIDC credential guard behaved correctly ✅" \
             >> "$GITHUB_STEP_SUMMARY"
 
   ### Unit tests for the TypeScript sources ###
@@ -871,9 +1194,11 @@ jobs:
         run: |
           # Run the loader and parity tests against each npm
           # Parity runs npm publish --dry-run offline against .invalid
-          # hosts, so nothing is contacted.
+          # hosts, so nothing is contacted. The OIDC suite reads each
+          # npm's own credential lookup and provenance defaults, on every
+          # npm at or above the trusted-publishing floor.
           npx vitest run test/npm-internals.real.test.ts \
-            test/registry.parity.test.ts
+            test/registry.parity.test.ts test/oidc.test.ts
 
   ### Verify the committed bundle matches the sources ###
   # GitHub runs this action straight from the repository, so dist/ has to
@@ -1208,6 +1533,7 @@ jobs:
               INPUT_PUBLISH_VERSION="${VERSION:-1.0.0}" \
               INPUT_DRY_RUN=true INPUT_NODE_VERSION=22 INPUT_TAG=latest \
               INPUT_PROVENANCE=false INPUT_LOAD_CREDENTIAL=false \
+              INPUT_OIDC=false \
               GITHUB_OUTPUT="${out}" node "${resolver}" 2>&1)"
             rc=$?
             set -e

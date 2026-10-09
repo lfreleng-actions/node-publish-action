@@ -32,6 +32,7 @@ const STATE: PublishState = {
   tag: 'latest',
   access: 'public',
   provenance: false,
+  idTokenEndpoint: false,
   registry: 'https://registry.example.invalid/',
   scopes: ['@a', '@b c'],
 };

@@ -94,6 +94,7 @@ function selfTest(): void {
     nexusUser: 'user',
     nexusPassword: '',
     authToken: 'token',
+    oidc: 'false',
     vaultMappingJson: '',
     opServiceAccountToken: '',
   };
@@ -113,6 +114,8 @@ function selfTest(): void {
     cliKeys: new Set(['registry']),
     flatten: (source, target) => Object.assign(target, source),
     validate: () => undefined,
+    getCredentialsByURI: () => ({}),
+    isDefault: () => true,
   };
   const pickRegistry: PickRegistry = (spec, opts) => {
     const scope = spec.startsWith('@') ? spec.slice(0, spec.indexOf('/')) : '';

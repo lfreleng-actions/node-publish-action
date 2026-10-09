@@ -40,6 +40,11 @@ export interface PublishState {
   readonly tag: string;
   readonly access: Access;
   readonly provenance: boolean;
+  /**
+   * Whether `npm publish` may see the OIDC token endpoint: only for a real
+   * trusted publish, or a real publish signing provenance.
+   */
+  readonly idTokenEndpoint: boolean;
   /** The registry npm will publish to. */
   readonly registry: string;
   /** Every scope whose `:registry` key npm would consult, to pin. */
@@ -126,6 +131,7 @@ export function readState(file: string, runnerTemp: string): PublishState {
     tag: field(record, 'tag', isString, 'a string'),
     access: field(record, 'access', isAccess, "'', 'public' or 'restricted'"),
     provenance: field(record, 'provenance', isBoolean, 'a boolean'),
+    idTokenEndpoint: field(record, 'idTokenEndpoint', isBoolean, 'a boolean'),
     registry: field(record, 'registry', isString, 'a string'),
     scopes: field(record, 'scopes', isStrings, 'a list of strings'),
   };

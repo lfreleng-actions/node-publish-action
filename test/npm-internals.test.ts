@@ -36,6 +36,8 @@ interface FakeNpm {
   config?: boolean;
   /** Where definitions live, if config is included. */
   definitions?: 'config' | 'npm' | 'none' | 'malformed';
+  /** Give Config the credential and default lookups npm 8+ has; default true. */
+  lookups?: boolean;
   /** npm's version; default 99.1.2. */
   version?: string;
   /** Prefix directory name under the test root; default 'prefix'. */
@@ -59,6 +61,7 @@ function fakeNpm(options: FakeNpm = {}): { prefix: string; npmDir: string; bin: 
     version = '99.1.2',
     prefixName = 'prefix',
     layout = 'posix',
+    lookups = true,
   } = options;
   const prefix = path.join(root, prefixName);
   const bin = layout === 'posix' ? path.join(prefix, 'bin') : prefix;
@@ -112,6 +115,12 @@ function fakeNpm(options: FakeNpm = {}): { prefix: string; npmDir: string; bin: 
         '  get (k) { return k === "argv" ? this.o.argv : this.o.env[k]; }',
         '  find (k) { return k in this.o.env ? "env" : null; }',
         '  get flat () { return { cwd: this.o.cwd }; }',
+        ...(lookups
+          ? [
+              '  getCredentialsByURI (uri) { return { token: this.o.env["token:" + uri] }; }',
+              '  isDefault (k) { return !(k in this.o.env); }',
+            ]
+          : []),
         '};',
       ].join('\n'),
     );
@@ -371,6 +380,31 @@ describe('loadNpmInternals', () => {
     await expect(loadConfig?.({ cwd: root, flags: [], env: {} })).rejects.toThrow(
       /does not export definitions, shorthands and flatten/,
     );
+  });
+
+  // The trusted-publishing checks put these questions to npm; without them
+  // there is nothing of npm's to ask, and no fallback is acceptable.
+  // npm 7 lacks isDefault and must still load for registry resolution, so
+  // the absence fails closed where a lookup is asked for.
+  it('loads without the lookups, and fails closed when one is asked for', async () => {
+    const { npmDir } = fakeNpm({ config: true, lookups: false });
+    const { loadConfig } = loadNpmInternals(npmDir);
+    const config = await loadConfig?.({ cwd: root, flags: [], env: {} });
+    expect(() => config?.getCredentialsByURI('https://r/')).toThrow(/has no getCredentialsByURI/);
+    expect(() => config?.isDefault('provenance')).toThrow(/has no isDefault/);
+  });
+
+  it("delegates the credential and default lookups to npm's Config", async () => {
+    const { npmDir } = fakeNpm({ config: true });
+    const { loadConfig } = loadNpmInternals(npmDir);
+    const config = await loadConfig?.({
+      cwd: root,
+      flags: [],
+      env: { 'token:https://r/': 't', provenance: 'false' },
+    });
+    expect(config?.getCredentialsByURI('https://r/')).toEqual({ token: 't' });
+    expect(config?.isDefault('provenance')).toBe(false);
+    expect(config?.isDefault('access')).toBe(true);
   });
 
   it("passes flags through argv, never this process's own arguments", async () => {

@@ -21,6 +21,8 @@ function config(flat: Record<string, unknown>, cliKeys: string[] = []): LoadedCo
     cliKeys: new Set(cliKeys),
     flatten: (source, target) => Object.assign(target, source),
     validate: () => undefined,
+    getCredentialsByURI: () => ({}),
+    isDefault: () => true,
   };
 }
 

@@ -340,6 +340,8 @@ describe('resolveEffectiveRegistry', () => {
           cliKeys: new Set<string>(),
           flatten,
           validate: () => undefined,
+          getCredentialsByURI: () => ({}),
+          isDefault: () => true,
         };
         expect(() =>
           resolveEffectiveRegistry({

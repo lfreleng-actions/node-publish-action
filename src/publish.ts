@@ -19,6 +19,7 @@ import path from 'node:path';
 
 import { locateNpm } from './npm-locate.js';
 import { npmRunner, type NpmRunner } from './npm-run.js';
+import { npmEnv } from './oidc.js';
 import {
   definedHooks,
   PUBLISH_HOOKS,
@@ -189,8 +190,13 @@ export function publish(
 
   // Lifecycle scripts run between here and the verification, and the
   // directory is repository content, so it is re-checked at each use.
+  //
+  // Neither stamping nor reading back has any use for an OIDC token, so
+  // npm never sees the endpoint for them. The publish sees it only when
+  // the state says this is a real trusted or provenance-signing publish.
+  const isolated = npmEnv(env, false);
   assertStillConfined(state.projectDir, dirs.boundary);
-  if (state.tarball === '') stamp(state, npm, env, io);
+  if (state.tarball === '') stamp(state, npm, isolated, io);
   warnPublishHooks(state, io);
 
   if (state.dryRun) {
@@ -198,7 +204,7 @@ export function publish(
   }
   const result = npm(publishArgs(state), {
     cwd: state.projectDir,
-    env,
+    env: npmEnv(env, state.idTokenEndpoint),
     stdoutFile: path.join(path.dirname(statePath), PUBLISH_OUTPUT),
     stderr: 'inherit',
   });
@@ -231,7 +237,7 @@ export function publish(
         `${publishedPrefix(false)} It cannot be verified: ${(cause as Error).message}`,
       );
     }
-    verify(state, metadata, npm, env, io);
+    verify(state, metadata, npm, isolated, io);
   }
   return metadata;
 }

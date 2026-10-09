@@ -17,6 +17,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { InputError } from '../src/inputs.js';
 import { loadNpmInternals, NpmInternalsError } from '../src/npm-internals.js';
+import { meetsFloor, OIDC_NPM_FLOOR } from '../src/oidc.js';
 import { prepare } from '../src/prepare.js';
 import { readState, STAGED_NAME, STATE_NAME } from '../src/state.js';
 import { isolatedEnv } from './support/ground-truth.js';
@@ -68,6 +69,7 @@ function env(inputs: Record<string, string> = {}): NodeJS.ProcessEnv {
     INPUT_TAG: 'latest',
     INPUT_PROVENANCE: 'false',
     INPUT_LOAD_CREDENTIAL: 'false',
+    INPUT_OIDC: 'false',
     ...inputs,
   };
 }
@@ -201,5 +203,101 @@ describe('prepare: publishing a pre-packed tarball', () => {
       'cannot resolve tarball_path',
     );
     expect(readdirSync(runnerTemp)).toEqual([]);
+  });
+});
+
+describe('prepare: OIDC trusted publishing', () => {
+  const ENDPOINT = {
+    ACTIONS_ID_TOKEN_REQUEST_URL: 'https://token.actions.example.invalid/',
+    ACTIONS_ID_TOKEN_REQUEST_TOKEN: 'request-token',
+  };
+  const OIDC = { INPUT_OIDC: 'true', INPUT_DRY_RUN: 'false', ...ENDPOINT };
+  // The floors apply to the npm and Node.js running the publish; tests on
+  // an older toolchain pass a Node.js that clears them, and skip where npm
+  // itself is below 11.5.2.
+  const npm = loadNpmInternals();
+  const npmClears = meetsFloor(npm.npmVersion, OIDC_NPM_FLOOR);
+  const NODE = '24.0.0';
+  // A test literal, not a credential.
+  const SHADOW_TOKEN = 'placeholder-not-a-secret';
+
+  it('refuses a real trusted publish without the id-token grant', async () => {
+    await expect(prepare(env({ INPUT_OIDC: 'true', INPUT_DRY_RUN: 'false' }))).rejects.toThrow(
+      "Grant 'id-token: write'",
+    );
+    expect(readdirSync(runnerTemp)).toEqual([]);
+  });
+
+  it('holds a dry run to the toolchain floor, but not to the grant', async () => {
+    await expect(
+      prepare(env({ INPUT_OIDC: 'true' }), loadNpmInternals, '22.13.0'),
+    ).rejects.toThrow('Node.js 22.13.0 is below the 22.14.0');
+  });
+
+  it.runIf(npmClears)('refuses a stored credential before anything is stamped', async () => {
+    writeFileSync(
+      path.join(workspace, 'project', '.npmrc'),
+      `//registry.example.invalid/:_authToken=${SHADOW_TOKEN}\n`,
+    );
+    await expect(prepare(env(OIDC), loadNpmInternals, NODE)).rejects.toThrow(
+      'stored npm credentials would shadow OIDC',
+    );
+    expect(readdirSync(runnerTemp)).toEqual([]);
+  });
+
+  it.runIf(npmClears)('refuses ambient provenance from publishConfig', async () => {
+    writeFileSync(
+      path.join(workspace, 'project', 'package.json'),
+      '{"name":"p","version":"1.0.0","publishConfig":{"provenance":true}}',
+    );
+    await expect(prepare(env(OIDC), loadNpmInternals, NODE)).rejects.toThrow('conflicts with oidc');
+  });
+
+  it.runIf(npmClears)('keeps the endpoint for a real trusted publish only', async () => {
+    const real = await prepare(env(OIDC), loadNpmInternals, NODE);
+    expect(readState(real.statePath, runnerTemp).idTokenEndpoint).toBe(true);
+    const rehearsal = await prepare(env({ ...OIDC, INPUT_DRY_RUN: 'true' }), loadNpmInternals, NODE);
+    expect(readState(rehearsal.statePath, runnerTemp).idTokenEndpoint).toBe(false);
+  });
+
+  // Hooks run after the guard and are repository code; the caller is told
+  // the limit, and how to remove it.
+  it.runIf(npmClears)('names publish hooks the guard cannot bind', async () => {
+    writeFileSync(
+      path.join(workspace, 'project', 'package.json'),
+      '{"name":"p","version":"1.0.0","scripts":{"prepare":"tsc"}}',
+    );
+    const result = await prepare(env(OIDC), loadNpmInternals, NODE);
+    expect(result.notices).toEqual([expect.stringContaining('lifecycle script(s): prepare')]);
+  });
+
+  it.runIf(npmClears)('notices an opt-out that leaves the publish unattested', async () => {
+    writeFileSync(path.join(workspace, 'project', '.npmrc'), 'provenance=false\n');
+    const result = await prepare(env(OIDC), loadNpmInternals, NODE);
+    expect(result.notices).toEqual([expect.stringContaining('carries no attestation')]);
+  });
+});
+
+describe('prepare: the token endpoint outside OIDC', () => {
+  const TOKEN = { INPUT_DRY_RUN: 'false', INPUT_AUTH_TOKEN: 't' };
+
+  it('withholds it from a token publish', async () => {
+    const result = await prepare(env(TOKEN));
+    expect(readState(result.statePath, runnerTemp).idTokenEndpoint).toBe(false);
+  });
+
+  // Provenance signs with the workflow identity, so a publish requesting
+  // it keeps the endpoint -- whether the input or the project asked.
+  // npm also attempts a trusted-publisher exchange with that endpoint, and
+  // the two cannot be separated, so the caller is told rather than left to
+  // believe the stored credential is the only route.
+  it.each([
+    ['the provenance input', { INPUT_PROVENANCE: 'true' }, undefined],
+    ['an .npmrc', {}, 'provenance=true\n'],
+  ])('keeps it when %s enables provenance, and says what that allows', async (_label, inputs, npmrc) => {
+    if (npmrc) writeFileSync(path.join(workspace, 'project', '.npmrc'), npmrc);
+    const result = await prepare(env({ ...TOKEN, ...inputs }));
+    expect(readState(result.statePath, runnerTemp).idTokenEndpoint).toBe(true);
+    expect(result.notices).toEqual([expect.stringContaining('trusted publisher configured')]);
   });
 });
