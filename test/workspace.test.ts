@@ -7,13 +7,13 @@
 
 import {
   constants,
-  existsSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
   realpathSync,
+  renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -25,20 +25,19 @@ import { spawnSync } from 'node:child_process';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { InputError } from '../src/inputs.js';
+import { STAGED_NAME } from '../src/state.js';
 import {
   anchor,
+  assertStillConfined,
   confineNodeVersionFile,
   confineProject,
   isSameRegularFile,
   isWithin,
   printable,
-  removeStaged,
   resolveTarball,
   runnerDirs,
   STAGE_OPEN_FLAGS,
-  STAGED_NAME,
   stageTarball,
-  STAGING_PREFIX,
   type RunnerDirs,
 } from '../src/workspace.js';
 
@@ -200,21 +199,16 @@ describe('resolveTarball', () => {
 });
 
 describe('stageTarball', () => {
-  it('copies the bytes into a private directory under RUNNER_TEMP', () => {
+  it('copies the bytes into the work directory', () => {
     writeFileSync(ws('ok.tgz'), 'archive bytes');
     const staged = stageTarball(ws('ok.tgz'), dirs.runnerTemp);
-    expect(path.basename(staged)).toBe(STAGED_NAME);
-    expect(path.basename(path.dirname(staged)).startsWith(STAGING_PREFIX)).toBe(true);
-    expect(path.dirname(path.dirname(staged))).toBe(dirs.runnerTemp);
+    expect(staged).toBe(path.join(dirs.runnerTemp, STAGED_NAME));
     expect(readFileSync(staged, 'utf8')).toBe('archive bytes');
-
-    removeStaged(staged);
-    expect(existsSync(path.dirname(staged))).toBe(false);
   });
 
   // The boundary check resolved the path, but the file may since have been
   // swapped for a link out of the workspace. Staging must not follow it.
-  it('refuses a source that became a symlink, and leaves nothing behind', () => {
+  it('refuses a source that became a symlink, and stages nothing', () => {
     writeFileSync(path.join(outside, 'secret.tgz'), 'outside bytes');
     symlinkSync(path.join(outside, 'secret.tgz'), ws('swapped.tgz'));
     expect(() => stageTarball(ws('swapped.tgz'), dirs.runnerTemp)).toThrow(
@@ -266,5 +260,34 @@ describe('stageTarball', () => {
     if (spawnSync('mkfifo', [fifo]).status !== 0) return;
     expect(() => stageTarball(fifo, dirs.runnerTemp)).toThrow('replaced while being staged');
     expect(readdirSync(dirs.runnerTemp)).toEqual([]);
+  });
+});
+
+describe('assertStillConfined', () => {
+  it('accepts a directory that still resolves to itself', () => {
+    expect(() => assertStillConfined(ws('project'), dirs.boundary)).not.toThrow();
+  });
+
+  // Lifecycle scripts run between the publish and its verification, and
+  // the directory is repository content.
+  it('refuses a directory swapped for a link out of the workspace', () => {
+    renameSync(ws('project'), ws('moved'));
+    symlinkSync(outside, ws('project'));
+    expect(() => assertStillConfined(ws('project'), dirs.boundary)).toThrow(
+      'no longer resolves where it did',
+    );
+  });
+
+  // npm could not run there, and verification failing for that reason
+  // would read as an unreadable registry and pass with a warning.
+  it('refuses a directory replaced by a file at the same path', () => {
+    rmSync(ws('project'), { recursive: true });
+    writeFileSync(ws('project'), 'not a directory');
+    expect(() => assertStillConfined(ws('project'), dirs.boundary)).toThrow('not a directory');
+  });
+
+  it('refuses a directory that has gone', () => {
+    rmSync(ws('project'), { recursive: true });
+    expect(() => assertStillConfined(ws('project'), dirs.boundary)).toThrow('has disappeared');
   });
 });

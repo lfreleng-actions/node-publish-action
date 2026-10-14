@@ -68,6 +68,18 @@ export function notice(message: string): void {
   writeCommand('notice', message);
 }
 
+export function warning(message: string): void {
+  writeCommand('warning', message);
+}
+
+/** Append markdown to the job summary, when the runner provides one. */
+export function appendSummary(markdown: string): void {
+  const file = process.env['GITHUB_STEP_SUMMARY'];
+  if (file !== undefined && file !== '') {
+    appendFileSync(file, markdown, 'utf8');
+  }
+}
+
 /** Report failure and set a non-zero exit status, as `core.setFailed` does. */
 export function setFailed(message: string): void {
   error(message);

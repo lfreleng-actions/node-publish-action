@@ -27,7 +27,7 @@ import { writeFileSync } from 'node:fs';
 const NODE_TARGET = 'node18';
 
 const entryPoints = [
-  { in: 'src/bin/parse-publish-output.ts', outDir: 'dist/parse-publish-output' },
+  { in: 'src/bin/publish.ts', outDir: 'dist/publish' },
   { in: 'src/bin/prepare.ts', outDir: 'dist/prepare' },
 ];
 

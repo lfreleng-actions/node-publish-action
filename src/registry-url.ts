@@ -122,7 +122,7 @@ function assertTextUsable(registry: string, where: string): void {
  *
  * https only, and lowercase: credentials cross this connection, and under a
  * trusted-publishing exchange the OIDC token is sent to it. registry_url is
- * already held to this in the validate step; an override arrives from the
+ * already held to this by the input checks; an override arrives from the
  * project's own files and has had no such check.
  */
 export function assertUsable(registry: string, source: RegistrySource, scope: string | null): void {

@@ -8,34 +8,31 @@
  *
  * Reads: the INPUT_* variables action.yaml passes, GITHUB_WORKSPACE,
  * RUNNER_TEMP and PATH.
- * Writes: the 'tarball', 'registry', 'registry_source' and
- * 'registry_scopes' outputs.
+ * Writes: the state file, and the 'state', 'registry', 'registry_source'
+ * and 'registry_scopes' outputs.
  */
+
+import path from 'node:path';
 
 import { error, info, notice, setOutput } from '../actions-io.js';
 import { checkInputs, type RawInputs } from '../inputs.js';
 import type { LoadedConfig, PickRegistry } from '../npm-internals.js';
 import { prepare, type PrepareResult } from '../prepare.js';
 import { resolveEffectiveRegistry } from '../registry.js';
-import { removeStaged } from '../workspace.js';
+import { removeWorkDir } from '../state.js';
 
 /** Write the outputs and say what was decided. */
 function emit(result: PrepareResult): void {
   const { resolution, inputs, tarball } = result;
   for (const message of result.notices) notice(message);
 
-  // Empty when packing the project directory. The staged copy, not the
-  // input, so later steps consume the bytes this step checked.
-  setOutput('tarball', tarball);
+  // Everything the publish step needs is in the state file. The registry
+  // is also an output because the .npmrc step between the two keys its
+  // credential to it.
+  setOutput('state', result.statePath);
   setOutput('registry', resolution.registry);
   setOutput('registry_source', resolution.source);
-  // Every consulted scope, one per line, so the publish and verification
-  // commands can pin each. Pinning only the winner leaves an earlier scope
-  // live for a prepublishOnly script to claim, and leaves a manifest-masked
-  // key free to re-activate under 'npm view', which does not load
-  // publishConfig at all.
-  //
-  // Newline separated: npm accepts a scope containing whitespace, and an
+  // One scope per line: npm accepts a scope containing whitespace, and an
   // .npmrc value cannot contain a newline, the file being line based.
   setOutput('registry_scopes', resolution.scopes.join('\n'));
 
@@ -61,9 +58,9 @@ async function main(): Promise<void> {
   try {
     emit(result);
   } catch (cause) {
-    // The cleanup step keys off the tarball output; if writing it failed,
-    // nothing will remove the staged copy but this.
-    if (result.tarball !== '') removeStaged(result.tarball);
+    // The cleanup step keys off the state output; if writing it failed,
+    // nothing will remove the work directory but this.
+    removeWorkDir(path.dirname(result.statePath));
     throw cause;
   }
 }
