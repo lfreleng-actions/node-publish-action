@@ -1604,7 +1604,7 @@ jobs:
               INPUT_PUBLISH_VERSION="${VERSION:-1.0.0}" \
               INPUT_DRY_RUN=true INPUT_NODE_VERSION=22 INPUT_TAG=latest \
               INPUT_PROVENANCE=false INPUT_LOAD_CREDENTIAL=false \
-              INPUT_OIDC=false \
+              INPUT_OIDC=false INPUT_IF_EXISTS=fail \
               GITHUB_OUTPUT="${out}" node "${resolver}" 2>&1)"
             rc=$?
             set -e

@@ -19,6 +19,8 @@ import path from 'node:path';
 
 import { locateNpm } from './npm-locate.js';
 import { npmRunner, type NpmRunner } from './npm-run.js';
+import { classifyExisting } from './existing.js';
+import { tarballFilename } from './integrity.js';
 import { npmEnv } from './oidc.js';
 import {
   AFTER_UPLOAD_HOOKS,
@@ -174,32 +176,14 @@ function verify(
   io.summary(`Registry confirmed ${name}@${version} ✅\n`);
 }
 
-/** Run the publish step from the state file at `statePath`. */
-export function publish(
+/** Run `npm publish` and read its result, failing as interpretPublish says. */
+function runPublish(
+  state: PublishState,
   statePath: string,
+  npm: NpmRunner,
   env: NodeJS.ProcessEnv,
   io: Reporter,
-  runner?: NpmRunner,
 ): PublishMetadata {
-  const dirs = runnerDirs(env);
-  const state = readState(statePath, dirs.runnerTemp);
-  let npm = runner;
-  if (npm === undefined) {
-    assertSameNpm(state, env['PATH']);
-    npm = npmRunner(state.npmDir);
-  }
-
-  // Lifecycle scripts run between here and the verification, and the
-  // directory is repository content, so it is re-checked at each use.
-  //
-  // Neither stamping nor reading back has any use for an OIDC token, so
-  // npm never sees the endpoint for them. The publish sees it only when
-  // the state says this is a real trusted or provenance-signing publish.
-  const isolated = npmEnv(env, false);
-  assertStillConfined(state.projectDir, dirs.boundary);
-  if (state.tarball === '') stamp(state, npm, isolated, io);
-  warnPublishHooks(state, io);
-
   if (state.dryRun) {
     io.info('Publishing in dry-run mode (packs and reports only; npm performs no publish)');
   }
@@ -226,8 +210,105 @@ export function publish(
     if (outcome.showOutput && result.stdout.trim() !== '') io.info(result.stdout);
     throw new PublishError(outcome.message);
   }
+  return outcome.metadata;
+}
 
-  const { metadata } = outcome;
+/**
+ * Under if_exists 'skip-if-identical', ask the registry before uploading.
+ * Returns the metadata to report when it already holds these exact bytes,
+ * and undefined when the version is absent and the publish should go on.
+ *
+ * Asked of the registry npm will publish to, every consulted scope pinned,
+ * with the publish's own credentials but never the OIDC endpoint. A dry
+ * run uploads nothing, so it is not asked. A version present with other
+ * content, or a question that cannot be answered, fails: npm cannot
+ * overwrite a version, and publishing blind would turn an unreadable
+ * registry into a conflict or a duplicate attempt.
+ */
+function existingCopy(
+  state: PublishState,
+  npm: NpmRunner,
+  env: NodeJS.ProcessEnv,
+  io: Reporter,
+): PublishMetadata | undefined {
+  if (state.dryRun || state.ifExists !== 'skip-if-identical') return undefined;
+  const name = state.packageName;
+  const version = state.publishVersion;
+  const spec = `${printable(name)}@${version}`;
+  if (name === '') {
+    throw new PublishError(
+      "the archive's package.json declares no name, so whether the registry holds it cannot be checked",
+    );
+  }
+  const result = npm(viewArgs(name, version, state, 'dist.integrity'), {
+    cwd: state.projectDir,
+    env,
+    stderr: 'pipe',
+  });
+  const existing = classifyExisting(result, state.integrity);
+  switch (existing.kind) {
+    case 'absent':
+      io.info(`${spec} is not on ${state.registry} yet; publishing it`);
+      return undefined;
+    case 'identical':
+      io.notice(
+        `${spec} is already on ${state.registry} with identical content ` +
+          `(${existing.integrity}), so it is not published again.`,
+      );
+      return {
+        name,
+        version,
+        filename: tarballFilename(name, version),
+        integrity: existing.integrity,
+      };
+    case 'different':
+      throw new PublishError(
+        `${spec} is already on ${state.registry} with different content: the ` +
+          `registry holds ${existing.integrity}, this archive is ` +
+          `${state.integrity}. npm cannot overwrite a published version; ` +
+          'publish these bytes under a new version.',
+      );
+    case 'unknown':
+      throw new PublishError(
+        `cannot tell whether ${spec} is already on ${state.registry} ` +
+          `(${existing.detail}). Under if_exists 'skip-if-identical' the ` +
+          'action does not publish without knowing; check the registry and ' +
+          'its credentials, then re-run.',
+      );
+  }
+}
+
+/** Run the publish step from the state file at `statePath`. */
+export function publish(
+  statePath: string,
+  env: NodeJS.ProcessEnv,
+  io: Reporter,
+  runner?: NpmRunner,
+): PublishMetadata {
+  const dirs = runnerDirs(env);
+  const state = readState(statePath, dirs.runnerTemp);
+  let npm = runner;
+  if (npm === undefined) {
+    assertSameNpm(state, env['PATH']);
+    npm = npmRunner(state.npmDir);
+  }
+
+  // Lifecycle scripts run between here and the verification, and the
+  // directory is repository content, so it is re-checked at each use.
+  //
+  // Neither stamping nor reading back has any use for an OIDC token, so
+  // npm never sees the endpoint for them. The publish sees it only when
+  // the state says this is a real trusted or provenance-signing publish.
+  const isolated = npmEnv(env, false);
+  assertStillConfined(state.projectDir, dirs.boundary);
+  if (state.tarball === '') stamp(state, npm, isolated, io);
+  warnPublishHooks(state, io);
+
+  const already = existingCopy(state, npm, isolated, io);
+  const metadata = already ?? runPublish(state, statePath, npm, env, io);
+  // 'true' only when this run uploaded: a dry run uploads nothing, and an
+  // identical copy was already there.
+  const published = already ? 'already-present' : state.dryRun ? 'false' : 'true';
   // npm has succeeded from here on, so every failure -- reporting the
   // result included, such as an unwritable GITHUB_OUTPUT -- must lead with
   // that, or it reads as an invitation to retry.
@@ -235,10 +316,21 @@ export function publish(
     io.setOutput('package_name', metadata.name);
     io.setOutput('published_version', metadata.version);
     io.setOutput('tarball_name', metadata.filename);
+    io.setOutput('published', published);
+    io.setOutput('integrity', metadata.integrity ?? state.integrity);
     io.summary(
-      renderSummary(metadata, { dryRun: state.dryRun, registryUrl: state.registry, tag: state.tag }),
+      renderSummary(metadata, {
+        dryRun: state.dryRun,
+        registryUrl: state.registry,
+        tag: state.tag,
+        alreadyPresent: already !== undefined,
+      }),
     );
-    io.info(`Published ${metadata.name}@${metadata.version} ✅`);
+    io.info(
+      already
+        ? `${metadata.name}@${metadata.version} was already published identically ✅`
+        : `Published ${metadata.name}@${metadata.version} ✅`,
+    );
 
     if (!state.dryRun) {
       try {

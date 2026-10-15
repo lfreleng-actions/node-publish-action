@@ -137,4 +137,32 @@ describe('interpretPublish', () => {
     const outcome = interpretPublish('E403 Forbidden', 1, options);
     expect(outcome.ok || outcome.message).toBe('npm publish failed (exit 1) ❌');
   });
+
+  // Two reports of this version with different digests: after a
+  // successful exit the outcome is do-not-retry; after a failing one, npm
+  // still reported the version, so the registry must be checked first.
+  const FLAT = '{"name":"pkg","version":"1.0.0","filename":"pkg-1.0.0.tgz","integrity":"sha512-a=="}';
+  const CONFLICT = `${FLAT}\n${FLAT.replace('sha512-a==', 'sha512-b==')}`;
+
+  it('reports conflicting digests after a successful exit as do-not-retry', () => {
+    const outcome = interpretPublish(CONFLICT, 0, real);
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.message).toContain('Do not retry');
+    expect(outcome.message).toContain('with different integrity digests');
+  });
+
+  it('treats conflicting digests after a failing exit as a reported publish', () => {
+    const outcome = interpretPublish(CONFLICT, 1, real);
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.message).toContain('after reporting pkg@1.0.0 as published');
+  });
+
+  // Conflicting reports of another version say nothing about this
+  // publish, so a failure stays plain.
+  it('keeps a failure plain when the conflicting reports are of another version', () => {
+    const outcome = interpretPublish(CONFLICT, 1, { expectedVersion: '2.0.0', dryRun: false });
+    expect(outcome.ok || outcome.message).toBe('npm publish failed (exit 1) ❌');
+  });
 });

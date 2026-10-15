@@ -60,6 +60,13 @@ function describeFailure(failure: ParseFailure): string {
         'version. A lifecycle script is most likely printing JSON of its ' +
         'own to stdout.'
       );
+    case 'conflicting-integrity':
+      return (
+        `npm's output held more than one report of ${failure.name}@${failure.version} ` +
+        'with different integrity digests, so which archive was uploaded ' +
+        'cannot be read from it. A lifecycle script is most likely printing ' +
+        'npm pack output, or JSON of its own, to stdout.'
+      );
     case 'truncated':
       return (
         "npm's output was too large or too dense with JSON to scan " +
@@ -102,8 +109,16 @@ export function interpretPublish(
   // invite a retry that cannot succeed.
   if (exitCode !== 0) {
     const reported = dryRun ? undefined : parsePublishOutput(raw, { expectedVersion });
-    if (reported?.ok && reported.metadata.version === expectedVersion) {
-      const { name, version } = reported.metadata;
+    // Conflicting digests still mean npm reported a version -- this one, or
+    // the report says nothing about this publish.
+    const report =
+      reported?.ok
+        ? reported.metadata
+        : reported !== undefined && !reported.ok && reported.failure.kind === 'conflicting-integrity'
+          ? reported.failure
+          : undefined;
+    if (report !== undefined && report.version === expectedVersion) {
+      const { name, version } = report;
       return {
         ok: false,
         message:

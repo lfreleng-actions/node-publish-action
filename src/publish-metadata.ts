@@ -22,6 +22,12 @@ export interface PublishMetadata {
   readonly name: string;
   readonly version: string;
   readonly filename: string;
+  /**
+   * The archive's sha512 integrity, as npm reports it. Optional: npm has
+   * always reported it, but it plays no part in recognising a report, so
+   * its absence never turns one away.
+   */
+  readonly integrity?: string;
 }
 
 export type ParseFailure =
@@ -32,7 +38,12 @@ export type ParseFailure =
   /** Several distinct objects looked like metadata and none could be preferred. */
   | { readonly kind: 'ambiguous'; readonly candidates: readonly PublishMetadata[] }
   /** A limit stopped the scan, so nothing found can be trusted as complete. */
-  | { readonly kind: 'truncated' };
+  | { readonly kind: 'truncated' }
+  /**
+   * Copies of the report for this version carried different integrity
+   * digests, so which archive was uploaded cannot be read from them.
+   */
+  | { readonly kind: 'conflicting-integrity'; readonly name: string; readonly version: string };
 
 export type ParseResult =
   | { readonly ok: true; readonly metadata: PublishMetadata }
@@ -149,7 +160,14 @@ export function parsePublishOutput(raw: string, options: ParseOptions = {}): Par
     };
   }
 
-  return { ok: true, metadata: selected.entries[0]! };
+  const metadata = selected.entries[0]!;
+  if (selected.integrityConflict) {
+    return {
+      ok: false,
+      failure: { kind: 'conflicting-integrity', name: metadata.name, version: metadata.version },
+    };
+  }
+  return { ok: true, metadata };
 }
 
 /**

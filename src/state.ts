@@ -13,7 +13,7 @@
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
-import type { Access } from './inputs.js';
+import type { Access, IfExists } from './inputs.js';
 
 /** The prefix of a work directory, which the cleanup step matches on. */
 export const WORK_PREFIX = 'npmpublish.';
@@ -36,6 +36,12 @@ export interface PublishState {
   /** The staged archive, or '' to pack the project directory. */
   readonly tarball: string;
   readonly publishVersion: string;
+  /** The package name, from the manifest npm will publish. */
+  readonly packageName: string;
+  /** What to do when the registry already holds the version. */
+  readonly ifExists: IfExists;
+  /** The staged archive's sha512 integrity, or '' with no archive. */
+  readonly integrity: string;
   readonly dryRun: boolean;
   readonly tag: string;
   readonly access: Access;
@@ -99,6 +105,8 @@ const isBoolean = (value: unknown): value is boolean => typeof value === 'boolea
 const isBooleanOrNull = (value: unknown): value is boolean | null => value === null || isBoolean(value);
 const isAccess = (value: unknown): value is Access =>
   value === '' || value === 'public' || value === 'restricted';
+const isIfExists = (value: unknown): value is IfExists =>
+  value === 'fail' || value === 'skip-if-identical';
 const isStrings = (value: unknown): value is string[] =>
   Array.isArray(value) && value.every(isString);
 
@@ -166,6 +174,9 @@ export function readState(file: string, runnerTemp: string): PublishState {
     userconfig: field(record, 'userconfig', isString, 'a string'),
     globalconfig: field(record, 'globalconfig', isString, 'a string'),
     idTokenEndpoint: field(record, 'idTokenEndpoint', isBoolean, 'a boolean'),
+    packageName: field(record, 'packageName', isString, 'a string'),
+    ifExists: field(record, 'ifExists', isIfExists, "'fail' or 'skip-if-identical'"),
+    integrity: field(record, 'integrity', isString, 'a string'),
     registry: field(record, 'registry', isString, 'a string'),
     scopes: field(record, 'scopes', isStrings, 'a list of strings'),
   };

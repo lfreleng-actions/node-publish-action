@@ -41,6 +41,11 @@ inputs:
     description: "Publish this already-packed .tgz instead of packing the project directory; must resolve within the workspace and carry publish_version. Skips the version stamp"
     required: false
     default: ""
+  if_exists:
+    # yamllint disable-line rule:line-length
+    description: "When the registry already holds publish_version: 'fail' (default), or 'skip-if-identical' to succeed without uploading when it holds the same bytes, compared by sha512 integrity. Skipping needs tarball_path"
+    required: false
+    default: "fail"
   node_version:
     # yamllint disable-line rule:line-length
     description: "Node.js version to set up, such as '22', '22.x' or 'lts/*'; characters A-Z a-z 0-9 . * / _ -"
@@ -121,6 +126,14 @@ outputs:
   tarball_name:
     description: "Tarball filename from the publish metadata"
     value: ${{ steps.publish.outputs.tarball_name }}
+  published:
+    # yamllint disable-line rule:line-length
+    description: "'true' when this run uploaded the package, 'already-present' when if_exists found identical bytes there, 'false' for a dry run"
+    value: ${{ steps.publish.outputs.published }}
+  integrity:
+    # yamllint disable-line rule:line-length
+    description: "The package's sha512 integrity (sha512-<base64>), as npm reports it or the registry holds it"
+    value: ${{ steps.publish.outputs.integrity }}
 
 runs:
   using: "composite"
@@ -173,6 +186,7 @@ runs:
         INPUT_NEXUS_PASSWORD: ${{ inputs.nexus_password }}
         INPUT_AUTH_TOKEN: ${{ inputs.auth_token }}
         INPUT_OIDC: ${{ inputs.oidc }}
+        INPUT_IF_EXISTS: ${{ inputs.if_exists }}
         INPUT_VAULT_MAPPING_JSON: ${{ inputs.vault_mapping_json }}
         INPUT_OP_SERVICE_ACCOUNT_TOKEN: ${{ inputs.op_service_account_token }}
       run: |

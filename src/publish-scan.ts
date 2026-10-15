@@ -61,6 +61,12 @@ export interface Normalised {
    * `{` left by hook text does not count as an enclosure.
    */
   readonly enclosingOpen: number | undefined;
+  /**
+   * Set when copies of this same report, in the same shape, carried
+   * different integrity digests: they describe different archives, so
+   * which one was uploaded cannot be read from them.
+   */
+  readonly integrityConflict?: boolean;
 }
 
 /**
@@ -74,6 +80,44 @@ export interface Normalised {
 interface ScanResult {
   readonly candidates: readonly Normalised[];
   readonly truncated: boolean;
+}
+
+/** Every digest copies of one report carried, per entry, by shape. */
+interface Digests {
+  readonly keyed: Set<string>;
+  readonly flat: Set<string>;
+}
+
+/** Record the digests `candidate` carries into `digests`. */
+function addDigests(digests: Digests[], candidate: Normalised): void {
+  candidate.entries.forEach((entry, i) => {
+    digests[i] ??= { keyed: new Set(), flat: new Set() };
+    if (entry.integrity !== undefined) {
+      (candidate.keyed ? digests[i].keyed : digests[i].flat).add(entry.integrity);
+    }
+  });
+}
+
+/**
+ * The report kept, with the integrity its copies agree on.
+ *
+ * Decided once, over every copy, so the answer does not depend on the
+ * order they appeared in. Per entry, keyed digests decide when there are
+ * any: npm 11's keyed report is its own shape and the stronger evidence,
+ * and a flat hook copy cannot displace it. Otherwise flat digests decide.
+ * Within the deciding shape, digests that differ describe different
+ * archives, and nothing says which was uploaded: that is a conflict.
+ */
+function settleIntegrity(kept: Normalised, digests: readonly Digests[]): Normalised {
+  let conflict = false;
+  const entries = kept.entries.map((entry, i) => {
+    const found = digests[i];
+    const deciding = found === undefined ? [] : [...(found.keyed.size > 0 ? found.keyed : found.flat)];
+    if (deciding.length > 1) conflict = true;
+    const identity = { name: entry.name, version: entry.version, filename: entry.filename };
+    return deciding.length === 1 ? { ...identity, integrity: deciding[0]! } : identity;
+  });
+  return conflict ? { ...kept, entries, integrityConflict: true } : { ...kept, entries };
 }
 
 /**
@@ -245,7 +289,10 @@ function asMetadata(value: unknown): PublishMetadata | undefined {
   if (typeof filename !== 'string' || filename === '') {
     return undefined;
   }
-  return { name, version, filename };
+  const { integrity } = record;
+  return typeof integrity === 'string' && integrity.startsWith('sha512-')
+    ? { name, version, filename, integrity }
+    : { name, version, filename };
 }
 
 /**
@@ -314,6 +361,7 @@ export function collectMatches(
   // Deduplicated by content: distinct objects reporting the same publish
   // are one result, not an ambiguity.
   const distinct = new Map<string, Normalised>();
+  const digests = new Map<string, Digests[]>();
 
   for (const candidate of candidates) {
     if (!candidate.keyed && candidate.enclosingOpen !== undefined) {
@@ -322,16 +370,27 @@ export function collectMatches(
         continue;
       }
     }
-    const key = JSON.stringify(candidate.entries);
+    // Keyed on the identifying fields alone, as before integrity was
+    // carried: a hook printing a copy without it is the same report.
+    const key = JSON.stringify(
+      candidate.entries.map(({ name, version, filename }) => [name, version, filename]),
+    );
     const existing = distinct.get(key);
     // Keep the keyed view when the same report arrives in both shapes:
     // npm 11's inner record closes first and reads as npm 10's flat
     // shape, and dropping the keyed one would discard the stronger
-    // evidence used to break ties later.
+    // evidence used to break ties later. Digests are gathered from every
+    // copy and settled once the scan is done.
     if (!existing || (candidate.keyed && !existing.keyed)) {
       distinct.set(key, candidate);
     }
+    const seen = digests.get(key) ?? [];
+    addDigests(seen, candidate);
+    digests.set(key, seen);
   }
 
-  return { matches: [...distinct.values()], truncated };
+  const matches = [...distinct.entries()].map(([key, kept]) =>
+    settleIntegrity(kept, digests.get(key) ?? []),
+  );
+  return { matches, truncated };
 }

@@ -95,6 +95,7 @@ function selfTest(): void {
     nexusPassword: '',
     authToken: 'token',
     oidc: 'false',
+    ifExists: 'fail',
     vaultMappingJson: '',
     opServiceAccountToken: '',
   };

@@ -7,6 +7,8 @@ export interface SummaryOptions {
   readonly dryRun: boolean;
   readonly registryUrl: string;
   readonly tag: string;
+  /** The registry already held these exact bytes; nothing was uploaded. */
+  readonly alreadyPresent?: boolean;
 }
 
 /** Build the job summary for a completed publish. */
@@ -20,6 +22,9 @@ export function renderSummary(metadata: PublishMetadata, options: SummaryOptions
     // destination. Not because it stays off the network: npm may still
     // query the registry during a dry run.
     lines.push('**Mode:** publish', `**Registry:** ${options.registryUrl}`);
+    if (options.alreadyPresent) {
+      lines.push('**Result:** already present with identical content; not uploaded again');
+    }
   }
 
   lines.push(

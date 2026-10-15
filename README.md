@@ -82,6 +82,7 @@ see [OIDC trusted publishing](#oidc-trusted-publishing).
 | dry_run                  | False    | `false`  | Pack and verify without publishing (npm may still read the registry); skips credential setup |
 | path_prefix              | False    | `.`      | Project directory; must resolve within the workspace                                         |
 | tarball_path             | False    | `''`     | Publish this already-packed `.tgz` instead of packing `path_prefix`; skips the version stamp |
+| if_exists                | False    | `fail`   | `fail`, or `skip-if-identical` to succeed without re-uploading identical bytes; see below    |
 | node_version             | False    | `22`     | Node.js version to set up, such as `22`, `22.x` or `lts/*`                                   |
 | node_version_file        | False    | `''`     | File containing the Node.js version, such as `.nvmrc`; overrides `node_version`              |
 | tag                      | False    | `latest` | npm distribution tag                                                                         |
@@ -127,6 +128,8 @@ The `nexus_user`, `scope` and credential inputs pass through to
 | published_version | Published version; stamped into `package.json` unless `tarball_path` supplied it |
 | package_name      | Package name from the publish metadata                                           |
 | tarball_name      | Tarball filename from the publish metadata                                       |
+| published         | `true` if uploaded, `already-present` if skipped as identical, else `false`      |
+| integrity         | The package's `sha512-<base64>` integrity, from npm or the registry              |
 
 <!-- markdownlint-enable MD013 -->
 
@@ -196,6 +199,14 @@ selects by **shape**: an object counts as publish metadata when it
 carries `name`, `version` and `filename` as strings, in either npm
 generation's layout. npm 10 placed those at the top level; npm 11
 keys the object by package name.
+
+npm's report also carries the archive's sha512 `integrity`, which the
+action passes on as the `integrity` output. Copies of the same report
+that disagree on it describe different archives, as when a
+`prepublishOnly` script prints `npm pack --json` for an earlier one. The
+action then reports no digest, and fails as for unreadable metadata
+rather than describe bytes that were not uploaded. npm 11's keyed report
+stands over a flat copy that disagrees with it.
 
 If npm's exit status is non-zero, the action reports a publish
 failure — unless npm's output already reports the requested version as
@@ -616,6 +627,40 @@ Three consequences follow from the tarball being the artefact:
 values resolve against `GITHUB_WORKSPACE`, and the resolved path must
 stay inside it. The action resolves the path before it inspects the
 file, so a symlink counts as its target rather than its own location.
+
+## Re-running a Publish
+
+npm-compatible registries never overwrite a version: publishing one that
+exists fails with `EPUBLISHCONFLICT`. A publish to more than one registry
+is not atomic either, so re-running one that partly succeeded fails on every
+registry that already holds the version.
+
+`if_exists: 'skip-if-identical'` makes that re-run safe. Before uploading,
+the action asks the registry for the version's `dist.integrity`, using
+the resolved registry and every consulted scope pinned, as for the publish
+itself:
+
+<!-- markdownlint-disable MD013 -->
+
+| Registry holds the version                                | Result                                                       |
+| --------------------------------------------------------- | ------------------------------------------------------------ |
+| No                                                        | Publishes as usual; `published` is `true`                    |
+| Yes, with the same sha512 integrity                       | Succeeds without uploading; `published` is `already-present` |
+| Yes, with different content                               | Fails, naming both integrities                               |
+| Cannot tell (any error but `E404`, or no sha512 reported) | Fails rather than publish blind                              |
+
+<!-- markdownlint-enable MD013 -->
+
+Identity is a comparison of bytes, so this needs `tarball_path`. The
+action hashes the staged copy of the archive, the exact bytes npm would
+upload. A directory publish has no archive to compare until npm packs it
+inside the publish. Dry runs upload nothing, so they never ask.
+
+The check reads the registry with the publish's own credentials. Under
+OIDC trusted publishing there is no stored credential, so for a
+restricted package the registry answers `E404` either way. The action
+then publishes as it would without this input, and if the version is
+there, npm's own `EPUBLISHCONFLICT` stops it.
 
 ## Path Constraints
 
