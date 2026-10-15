@@ -294,6 +294,77 @@ jobs:
           echo "Invalid inputs correctly rejected ✅" \
             >> "$GITHUB_STEP_SUMMARY"
 
+  ### Test setup-node's implicit npm cache stays off ###
+  # setup-node enables npm caching by itself when the workspace root's
+  # package.json names npm in packageManager, and with no lockfile at the
+  # root its cache restore fails the step. The fixture here is exactly that
+  # root, so the dry run completes only if the action disables the cache --
+  # which is also what keeps a restored cache out of a publishing job.
+  test-no-package-manager-cache:
+    name: "Test: setup-node's implicit npm cache is disabled"
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 10
+    steps:
+      # Load the egress allow-list out-of-band from the
+      # organisation's .github repository and publish it as
+      # $CONNECTION_ALLOW_LIST for the harden-runner step below.
+      # yamllint disable-line rule:line-length
+      - uses: lfreleng-actions/harden-runner-block-action@a32eb064a1188f6b0f15d2c0c0381efe54b0dd22 # v0.12.2
+        with:
+          config: '@807a544b7e55a9224b2b3780e636467bd4b5b99b' # v0.5.0
+
+      # Harden the runner with the just-loaded allow-list.
+      - name: "Harden runner (block)"
+        # yamllint disable-line rule:line-length
+        uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: 'block'
+          allowed-endpoints: >
+            ${{ env.CONNECTION_ALLOW_LIST }}
+
+      # No checkout: the workspace root must hold this package.json and no
+      # lockfile, which is the case setup-node's auto-cache cannot handle.
+      - name: "Create a root that names npm as its package manager"
+        shell: bash
+        run: |
+          # Create a root that names npm as its package manager
+          printf '%s\n' \
+            '{"name": "lfreleng-node-publish-action-pm-fixture",' \
+            ' "version": "1.0.0", "packageManager": "npm@10.9.2"}' \
+            > package.json
+          jq -e . package.json > /dev/null
+          # Any one lockfile lets setup-node's cache restore succeed, and
+          # the dry run would then prove nothing, so each is checked.
+          for lockfile in package-lock.json npm-shrinkwrap.json yarn.lock; do
+            if [ -e "${lockfile}" ]; then
+              echo "The fixture must have no lockfile: found ${lockfile} ❌"
+              exit 1
+            fi
+          done
+
+      - name: "Dry-run publish from that root"
+        id: publish
+        uses: $/
+        with:
+          node_version: '22'
+          publish_version: '1.0.1'
+          dry_run: 'true'
+
+      - name: "Verify the publish ran without a cache"
+        shell: bash
+        env:
+          PUBLISHED_VERSION: ${{ steps.publish.outputs.published_version }}
+        run: |
+          # Verify the publish ran without a cache
+          if [ "${PUBLISHED_VERSION}" != "1.0.1" ]; then
+            echo "The dry run did not complete ❌"
+            exit 1
+          fi
+          echo "No implicit npm cache was used ✅"
+          echo "No implicit npm cache was used ✅" >> "$GITHUB_STEP_SUMMARY"
+
   ### Test version lifecycle scripts stay suppressed ###
   test-lifecycle-hooks:
     name: "Test: version lifecycle scripts do not run"
