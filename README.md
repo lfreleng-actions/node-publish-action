@@ -630,7 +630,13 @@ escape the workspace fail the action.
 ## Notes
 
 - The action performs no dependency caching, in line with the
-  organisation's cache-poisoning stance
+  organisation's cache-poisoning stance. That includes the npm cache
+  `actions/setup-node` enables by itself when the repository's root
+  `package.json` names npm in `packageManager` or
+  `devEngines.packageManager`: the action passes
+  `package-manager-cache: false`. Without that, a root with no lockfile
+  would also fail at setup-node, which cannot find one to key the cache
+  on
 - `--allow-same-version` keeps re-stamping idempotent when the
   committed `package.json` version already matches the request
 - Stamping uses `--ignore-scripts`, so `preversion`, `version` and

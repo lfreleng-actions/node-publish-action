@@ -136,6 +136,14 @@ runs:
         # yamllint disable-line rule:line-length
         node-version: ${{ inputs.node_version_file == '' && inputs.node_version || '' }}
         node-version-file: ${{ inputs.node_version_file }}
+        # setup-node enables npm caching by itself when the repository's
+        # root package.json names npm in packageManager or
+        # devEngines.packageManager. Disabled: this step runs in the job
+        # holding publish credentials, where a restored cache is a
+        # cache-poisoning route (CWE-349). It also spares callers whose
+        # root has no lockfile, where setup-node's cache restore fails the
+        # step outright.
+        package-manager-cache: false
 
     # Check every input, confine the paths to the workspace, stage a
     # pre-packed tarball outside it, and resolve the registry npm will
