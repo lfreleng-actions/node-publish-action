@@ -338,6 +338,59 @@ describe('loadNpmInternals', () => {
     expect(loadNpmInternals(npmDir).pickRegistry('p', {})).toBe('x');
   });
 
+  describe('subpath requests', () => {
+    // The closure walk checks where each dependency's *bare name* resolves.
+    // A subpath such as 'dep/lib/x' resolves file by file: with npm's own
+    // dep present but missing lib/x.js, and no exports map, Node tries each
+    // ancestor node_modules in turn and runs the copy beside npm.
+    function escapingSubpath(npmDir: string): string {
+      write(path.join(npmDir, 'node_modules', 'dep', 'package.json'), '{"name":"dep"}');
+      write(path.join(npmDir, 'node_modules', 'dep', 'index.js'), 'module.exports = {};');
+      const marker = path.join(root, 'EXECUTED');
+      write(
+        path.join(path.dirname(npmDir), 'dep', 'lib', 'x.js'),
+        `require('fs').writeFileSync(${JSON.stringify(marker)}, 'ran');`,
+      );
+      return marker;
+    }
+
+    it('refuses one escaping as npm loads', () => {
+      const { npmDir } = fakeNpm();
+      rewriteFetch(npmDir, { dependencies: { dep: '*' } }, "require('dep/lib/x');");
+      const marker = escapingSubpath(npmDir);
+      expect(() => loadNpmInternals(npmDir)).toThrow(/resolves outside npm's own tree/);
+      expect(existsSync(marker)).toBe(false);
+    });
+
+    // npm requires some modules lazily, when a function first runs. The
+    // guard has to outlast loading for those.
+    it('refuses one escaping when npm requires it lazily', () => {
+      const { npmDir } = fakeNpm();
+      const fetchDir = path.join(npmDir, 'node_modules', 'npm-registry-fetch');
+      write(
+        path.join(fetchDir, 'package.json'),
+        JSON.stringify({ main: 'index.js', dependencies: { dep: '*' } }),
+      );
+      write(
+        path.join(fetchDir, 'index.js'),
+        "module.exports = { pickRegistry: () => { require('dep/lib/x'); return 'x'; } };",
+      );
+      const marker = escapingSubpath(npmDir);
+      const { pickRegistry } = loadNpmInternals(npmDir);
+      expect(() => pickRegistry('p', {})).toThrow(/resolves outside npm's own tree/);
+      expect(existsSync(marker)).toBe(false);
+    });
+
+    it('still loads a subpath npm ships', () => {
+      const { npmDir } = fakeNpm();
+      rewriteFetch(npmDir, { dependencies: { dep: '*' } }, "require('dep/lib/x');");
+      escapingSubpath(npmDir);
+      write(path.join(npmDir, 'node_modules', 'dep', 'lib', 'x.js'), 'module.exports = {};');
+      expect(loadNpmInternals(npmDir).pickRegistry('p', {})).toBe('x');
+      expect(existsSync(path.join(root, 'EXECUTED'))).toBe(false);
+    });
+  });
+
   it('reports a module that is present but fails to load, rather than calling it absent', () => {
     // A missing *transitive* import raises MODULE_NOT_FOUND too. It must
     // not read as "this location does not exist" and fall through.
