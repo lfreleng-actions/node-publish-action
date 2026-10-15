@@ -89,6 +89,19 @@ describe.each(npmDirs)('npm at %s', (npmDir) => {
     expect(internals.pickRegistry('@set/p', config.flat)).toBe('https://cli.example/');
   });
 
+  it.runIf(major >= 7)('reports the files it loaded, not the values they set', async () => {
+    const user = path.join(project, 'user.npmrc');
+    writeFileSync(user, `userconfig=${path.join(project, 'elsewhere.npmrc')}\n`);
+    const global = path.join(project, 'global.npmrc');
+    const config = await internals.loadConfig?.({
+      cwd: project,
+      flags: [`--userconfig=${user}`, `--globalconfig=${global}`],
+      env: {},
+    });
+    if (!config) throw new Error('loadConfig unavailable');
+    expect(config.loadedFiles).toEqual({ user, global });
+  });
+
   it.runIf(major < 7)('offers no config loader before @npmcli/config', () => {
     expect(internals.loadConfig).toBeUndefined();
   });

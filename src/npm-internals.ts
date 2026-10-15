@@ -78,6 +78,12 @@ export interface LoadedConfig {
   /** Keys set on the command line, as npm parsed them. */
   readonly cliKeys: ReadonlySet<string>;
   /**
+   * The files npm loaded as its user and global layers. Not the
+   * `userconfig` and `globalconfig` values, which those files can
+   * themselves override without npm loading the files they name.
+   */
+  readonly loadedFiles: { readonly user: string; readonly global: string };
+  /**
    * npm's own flatten: apply `source` over `target` the way npm applies
    * publishConfig. Mutates `target`.
    */
@@ -92,6 +98,26 @@ export interface LoadedConfig {
    * which npm's own error carries verbatim, credentials included.
    */
   validate(): void;
+  /**
+   * The credentials npm would use for `uri`: npm's own lookup, which
+   * `npm publish` calls on the registry it picked. It reads one exact
+   * nerf-darted key per credential and walks no ancestor paths.
+   */
+  getCredentialsByURI(uri: string): Credentials;
+  /**
+   * Whether `key` holds its default, set in no configuration layer. npm's
+   * trusted publishing enables provenance by itself only while this is
+   * true of `provenance`.
+   */
+  isDefault(key: string): boolean;
+}
+
+/** The fields of npm's credential lookup this action inspects. */
+export interface Credentials {
+  readonly token?: unknown;
+  readonly username?: unknown;
+  readonly certfile?: unknown;
+  readonly keyfile?: unknown;
 }
 
 export interface LoadConfigOptions {
@@ -152,9 +178,11 @@ interface ConfigInstance {
   get(key: string): unknown;
   find(key: string): string | null;
   readonly flat: Record<string, unknown>;
-  readonly data?: Map<string, { raw?: Record<string, unknown> }>;
+  readonly data?: Map<string, { raw?: Record<string, unknown>; source?: unknown }>;
   readonly globalPrefix?: unknown;
   validate?: () => boolean;
+  getCredentialsByURI?: (uri: string) => Credentials;
+  isDefault?: (key: string) => boolean;
 }
 
 type ConfigConstructor = new (options: Record<string, unknown>) => ConfigInstance;
@@ -202,22 +230,51 @@ async function loadConfigFrom(
     cwd,
     env,
   });
-  await instance.load();
-  assertLauncherRunsTree(instance.globalPrefix, tree);
-  // Materialise the flattened options now, before anything else touches
-  // the configuration. npm does exactly this: npm.js reads flatOptions
-  // straight after config.load(), and only then constructs the command,
-  // whose constructor runs validate(). validate() coerces values in place
-  // -- on npm 9 and later it turns a parsed `scope=null` into the string
-  // "null" -- but the cached flat object npm publishes with was built
-  // beforehand, so npm never sees the coercion. Reading flat after
-  // validate() would.
-  const flat = instance.flat;
+  // npm resolves path-valued settings -- a relative userconfig or
+  // provenance-file -- against the process's working directory, not cwd
+  // above, and npm publish runs in the project directory.
+  const previous = process.cwd();
+  process.chdir(cwd);
+  let flat: Readonly<Record<string, unknown>>;
+  try {
+    await instance.load();
+    assertLauncherRunsTree(instance.globalPrefix, tree);
+    // Materialise the flattened options now, before anything else touches
+    // the configuration. npm does exactly this: npm.js reads flatOptions
+    // straight after config.load(), and only then constructs the command,
+    // whose constructor runs validate(). validate() coerces values in place
+    // -- on npm 9 and later it turns a parsed `scope=null` into the string
+    // "null" -- but the cached flat object npm publishes with was built
+    // beforehand, so npm never sees the coercion. Reading flat after
+    // validate() would.
+    flat = instance.flat;
+  } finally {
+    process.chdir(previous);
+  }
   const flatten = defs.flatten as (
     source: Readonly<Record<string, unknown>>,
     target: Record<string, unknown>,
   ) => void;
   const cliKeys = new Set(Object.keys(instance.data?.get('cli')?.raw ?? {}));
+  const loadedFile = (where: 'user' | 'global'): string => {
+    const source = instance.data?.get(where)?.source;
+    return typeof source === 'string' ? source : '';
+  };
+  const loadedFiles = { user: loadedFile('user'), global: loadedFile('global') };
+  // Present from npm 8.19 (measured to 12), and needed only by the
+  // trusted-publishing checks, which require npm 11.5.2. npm 7 and 8.1 lack
+  // isDefault, and their configuration must still load for registry
+  // resolution, so absence fails closed where a lookup is asked for rather
+  // than here -- never falling back to a guess.
+  const lookup = <A extends unknown[], R>(
+    name: 'getCredentialsByURI' | 'isDefault',
+  ): ((...args: A) => R) => {
+    const method = instance[name] as ((...args: A) => R) | undefined;
+    if (typeof method === 'function') return (...args) => method.apply(instance, args);
+    return () => {
+      throw new NpmInternalsError(`npm ${npmVersion}: @npmcli/config has no ${name}.`);
+    };
+  };
   return {
     get: (key) => instance.get(key),
     find: (key) => instance.find(key) as ConfigLayer | null,
@@ -225,6 +282,7 @@ async function loadConfigFrom(
       return flat;
     },
     cliKeys,
+    loadedFiles,
     flatten: (source, target) => flatten(source, target),
     validate: () => {
       // Present on every npm from 7 to 11; guarded, not assumed.
@@ -240,6 +298,8 @@ async function loadConfigFrom(
         );
       }
     },
+    getCredentialsByURI: lookup<[string], Credentials>('getCredentialsByURI'),
+    isDefault: lookup<[string], boolean>('isDefault'),
   };
 }
 

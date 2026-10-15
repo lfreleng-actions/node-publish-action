@@ -47,11 +47,16 @@ export function meetsVersion(npmVersion: string, floor: readonly [number, number
  * when choosing the project root, and so which project .npmrc applies.
  * The publish step passes it unconditionally. Shared with the parity
  * tests, so the flags they check are the flags that ship.
+ *
+ * `--provenance` is included when the input requests it, so the provenance
+ * resolved is npm's own answer for that command line: publishConfig beats
+ * the flag before npm 10.5.2, and the flag beats publishConfig from then on.
  */
-export function publishFlags(registryUrl: string): string[] {
+export function publishFlags(registryUrl: string, provenance = false): string[] {
   const flags = ['--no-workspaces'];
   const url = registryUrl.trim();
   if (url !== '') flags.push(`--registry=${url}`);
+  if (provenance) flags.push('--provenance');
   return flags;
 }
 
