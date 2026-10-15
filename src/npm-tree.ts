@@ -10,11 +10,100 @@
  */
 
 import { existsSync, readFileSync, realpathSync } from 'node:fs';
-import { createRequire } from 'node:module';
+import Module, { createRequire } from 'node:module';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 /** Raised when npm's internals cannot be located or loaded. */
 export class NpmInternalsError extends Error {}
+
+/** npm trees whose code may only load modules from inside itself. */
+const guardedRoots = new Set<string>();
+let guardInstalled = false;
+
+/** The guarded npm tree `file` lies in, if any. */
+function guardedRootOf(file: string | undefined): string | undefined {
+  if (file === undefined) return undefined;
+  for (const root of guardedRoots) {
+    if (file.startsWith(root + path.sep)) return root;
+  }
+  return undefined;
+}
+
+/**
+ * Refuse a resolution made from inside a guarded npm tree that lands
+ * outside it. Built-in modules resolve to a bare name and pass.
+ *
+ * The error carries MODULE_NOT_FOUND. To npm's code the module is absent
+ * from its tree, which is the truth, so npm's own handling of an optional
+ * module that is not installed applies; anything else surfaces this
+ * message.
+ */
+function checkResolution(request: string, resolved: string, parentFile: string | undefined): void {
+  const root = guardedRootOf(parentFile);
+  if (root === undefined || !path.isAbsolute(resolved)) return;
+  let real = resolved;
+  try {
+    real = realpathSync(resolved);
+  } catch {
+    // Judged by the path Node resolved; it cannot load what does not exist.
+  }
+  if (real.startsWith(root + path.sep)) return;
+  const refusal = new NpmInternalsError(
+    `npm's code requested '${request}', which resolves outside npm's own ` +
+      `tree, to ${real}. Refusing to load it: it is not code the publishing ` +
+      'npm ships. The npm installation is incomplete.',
+  );
+  (refusal as NodeJS.ErrnoException).code = 'MODULE_NOT_FOUND';
+  throw refusal;
+}
+
+type ResolveFilename = (request: string, parent: { filename?: string } | undefined, ...rest: unknown[]) => string;
+
+/**
+ * Confine every module npm's code loads to npm's own tree, for the rest of
+ * this short-lived process.
+ *
+ * {@link assertClosureInTree} checks where each dependency's bare name
+ * resolves, before anything runs. It cannot see a subpath request such as
+ * `require('dep/lib/x')`: for a package without an exports map, Node
+ * resolves one by trying each ancestor node_modules, so a file missing from
+ * npm's copy falls through to a same-named package beside npm. The only
+ * complete answer is to check each resolution as it happens -- including
+ * the ones npm makes lazily, when a function first runs.
+ *
+ * CommonJS resolution is wrapped, which covers every npm this action
+ * supports. Where the runtime offers module.registerHooks, it is used too,
+ * so import() is covered as well.
+ */
+export function guardTree(npmRoot: string): void {
+  guardedRoots.add(npmRoot);
+  if (guardInstalled) return;
+  guardInstalled = true;
+
+  // _resolveFilename is internal to Node and absent from its types.
+  const loader = Module as typeof Module & { _resolveFilename: ResolveFilename };
+  const original = loader._resolveFilename;
+  loader._resolveFilename = function (this: unknown, request, parent, ...rest) {
+    const resolved = original.call(this, request, parent, ...rest);
+    checkResolution(request, resolved, parent?.filename);
+    return resolved;
+  };
+
+  // Read off the default export, not imported by name: a named import would
+  // fail to link on a Node.js that lacks it, and the bundle targets older.
+  if (typeof Module.registerHooks === 'function') {
+    Module.registerHooks({
+      resolve(specifier, context, nextResolve) {
+        const result = nextResolve(specifier, context);
+        if (result.url.startsWith('file:') && context.parentURL?.startsWith('file:')) {
+          checkResolution(specifier, fileURLToPath(result.url), fileURLToPath(context.parentURL));
+        }
+        return result;
+      },
+    });
+  }
+}
 
 /** What loadConfig needs to know about the npm it loads from. */
 export interface NpmTree {

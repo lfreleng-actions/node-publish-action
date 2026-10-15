@@ -34,6 +34,7 @@ import { assertLauncherRunsTree, locateNpm } from './npm-locate.js';
 import { readManifestFrom, type Manifest, type ManifestTarget } from './npm-manifest.js';
 import {
   assertClosureInTree,
+  guardTree,
   loadResolved,
   NpmInternalsError,
   resolveInTree,
@@ -312,9 +313,11 @@ export function loadNpmInternals(npmDir: string = locateNpm()): NpmInternals {
   if (typeof npmVersion !== 'string') {
     throw new NpmInternalsError(`${npmDir} has no npm version in package.json.`);
   }
-  // Before any of npm's code runs: every module it could require, however
-  // deep and however late, must be the one npm ships.
+  // Before any of npm's code runs: every package it could require must be
+  // the one npm ships, and every module it then resolves -- a subpath
+  // included, however late -- must lie in npm's tree.
   assertClosureInTree(npmRoot, npmVersion);
+  guardTree(npmRoot);
   const major = Number(npmVersion.split('.')[0]);
 
   const fetchPath = resolveInTree(req, 'npm-registry-fetch', npmRoot);

@@ -354,7 +354,7 @@ describe('loadNpmInternals', () => {
       return marker;
     }
 
-    it.fails('refuses one escaping as npm loads', () => {
+    it('refuses one escaping as npm loads', () => {
       const { npmDir } = fakeNpm();
       rewriteFetch(npmDir, { dependencies: { dep: '*' } }, "require('dep/lib/x');");
       const marker = escapingSubpath(npmDir);
@@ -364,7 +364,7 @@ describe('loadNpmInternals', () => {
 
     // npm requires some modules lazily, when a function first runs. The
     // guard has to outlast loading for those.
-    it.fails('refuses one escaping when npm requires it lazily', () => {
+    it('refuses one escaping when npm requires it lazily', () => {
       const { npmDir } = fakeNpm();
       const fetchDir = path.join(npmDir, 'node_modules', 'npm-registry-fetch');
       write(
