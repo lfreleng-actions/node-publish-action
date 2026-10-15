@@ -65,6 +65,7 @@ function env(inputs: Record<string, string> = {}): NodeJS.ProcessEnv {
     INPUT_PROVENANCE: 'false',
     INPUT_LOAD_CREDENTIAL: 'false',
     INPUT_OIDC: 'false',
+    INPUT_IF_EXISTS: 'fail',
     ...inputs,
   };
 }
@@ -103,6 +104,9 @@ describe('publish: a dry run through real npm', () => {
       package_name: 'lfreleng-publish-test',
       published_version: '7.7.7',
       tarball_name: 'lfreleng-publish-test-7.7.7.tgz',
+      // A dry run uploads nothing; the integrity is npm's own report.
+      published: 'false',
+      integrity: expect.stringMatching(/^sha512-[A-Za-z0-9+/]+={0,2}$/),
     });
     expect(of('summary').join('')).toContain('**Mode:** dry run');
   });
@@ -336,5 +340,122 @@ describe('publish: verification', () => {
       return { status: 0, stdout: '', stderr: '' };
     };
     expect(() => publish(statePath, env(inputs), recorder().io, removing)).toThrow('Do not retry');
+  });
+});
+
+describe('publish: if_exists', () => {
+  const REPORT = '{"packed-package":{"name":"packed-package","version":"7.7.7","filename":"packed-package-7.7.7.tgz"}}';
+
+  /** Prepare a real tarball publish, returning its state and integrity. */
+  async function staged(ifExists: string, dryRun = 'false') {
+    write('proj/package.json', '{"name":"decoy","version":"0.0.1"}');
+    const staging = path.join(root, 'pack', 'package');
+    mkdirSync(staging, { recursive: true });
+    writeFileSync(path.join(staging, 'package.json'), '{"name":"packed-package","version":"7.7.7"}');
+    spawnSync('tar', ['-czf', path.join(workspace, 'packed.tgz'), '-C', path.dirname(staging), 'package']);
+    const inputs = {
+      INPUT_DRY_RUN: dryRun,
+      INPUT_AUTH_TOKEN: 't',
+      INPUT_TARBALL_PATH: 'packed.tgz',
+      INPUT_IF_EXISTS: ifExists,
+    };
+    const { statePath } = await prepare(env(inputs));
+    return { statePath, inputs, integrity: readState(statePath, runnerTemp).integrity };
+  }
+
+  /** A runner answering npm view dist.integrity with `existing`. */
+  function registry(existing: NpmResult) {
+    const calls: string[][] = [];
+    const runner: NpmRunner = (args, options) => {
+      calls.push([...args]);
+      if (args[0] === 'view' && args[2] === 'dist.integrity') return existing;
+      if (args[0] === 'view') return { status: 0, stdout: '7.7.7\n', stderr: '' };
+      if (options.stdoutFile) writeFileSync(options.stdoutFile, REPORT);
+      return { status: 0, stdout: REPORT, stderr: '' };
+    };
+    return { runner, calls };
+  }
+
+  it('records the staged archive\'s sha512 integrity in the state', async () => {
+    const { integrity } = await staged('skip-if-identical');
+    expect(integrity).toMatch(/^sha512-[A-Za-z0-9+/]+={0,2}$/);
+  });
+
+  it('succeeds without uploading when the registry holds identical bytes', async () => {
+    const { statePath, inputs, integrity } = await staged('skip-if-identical');
+    const { runner, calls } = registry({ status: 0, stdout: `${integrity}\n`, stderr: '' });
+    const rec = recorder();
+    publish(statePath, env(inputs), rec.io, runner);
+    expect(calls.map((c) => c[0])).not.toContain('publish');
+    expect(rec.outputs).toMatchObject({
+      package_name: 'packed-package',
+      published_version: '7.7.7',
+      tarball_name: 'packed-package-7.7.7.tgz',
+      published: 'already-present',
+      integrity,
+    });
+    expect(rec.of('notice')).toEqual([expect.stringContaining('identical content')]);
+    expect(rec.of('summary').join('')).toContain('already present with identical content');
+  });
+
+  it('fails when the registry holds different bytes, and uploads nothing', async () => {
+    const { statePath, inputs } = await staged('skip-if-identical');
+    const { runner, calls } = registry({ status: 0, stdout: 'sha512-AAAA\n', stderr: '' });
+    expect(() => publish(statePath, env(inputs), recorder().io, runner)).toThrow(
+      /already on .* with different content: the registry holds sha512-AAAA/,
+    );
+    expect(calls.map((c) => c[0])).not.toContain('publish');
+  });
+
+  it('publishes when the version is absent', async () => {
+    const { statePath, inputs, integrity } = await staged('skip-if-identical');
+    const { runner, calls } = registry({ status: 1, stdout: '', stderr: 'npm error code E404\n' });
+    const rec = recorder();
+    publish(statePath, env(inputs), rec.io, runner);
+    expect(calls.map((c) => c[0])).toEqual(['view', 'publish', 'view']);
+    expect(rec.outputs).toMatchObject({ published: 'true', integrity });
+  });
+
+  // Publishing blind would turn an unreadable registry into a conflict.
+  it.each([
+    ['an error other than E404', { status: 1, stdout: '', stderr: 'npm error code E401\n' }, 'E401'],
+    ['an answer with no integrity', { status: 0, stdout: '\n', stderr: '' }, 'no integrity reported'],
+  ])('refuses to publish on %s', async (_label, answer, detail) => {
+    const { statePath, inputs } = await staged('skip-if-identical');
+    const { runner, calls } = registry(answer);
+    expect(() => publish(statePath, env(inputs), recorder().io, runner)).toThrow(
+      new RegExp(`cannot tell whether .*\\(${detail}\\)`),
+    );
+    expect(calls.map((c) => c[0])).not.toContain('publish');
+  });
+
+  it('asks the resolved registry, every consulted scope pinned', async () => {
+    const { statePath, inputs, integrity } = await staged('skip-if-identical');
+    const { runner, calls } = registry({ status: 0, stdout: integrity, stderr: '' });
+    publish(statePath, env(inputs), recorder().io, runner);
+    const state = readState(statePath, runnerTemp);
+    expect(calls[0]?.slice(0, 3)).toEqual(['view', 'packed-package@7.7.7', 'dist.integrity']);
+    // The configuration the publish reads, and the resolved registry.
+    expect(calls[0]).toEqual(
+      expect.arrayContaining([
+        '--no-workspaces',
+        `--userconfig=${state.userconfig}`,
+        `--globalconfig=${state.globalconfig}`,
+        '--scope=',
+        '--registry',
+        'https://registry.example.invalid/',
+      ]),
+    );
+  });
+
+  it.each([
+    ["the default, 'fail'", 'fail', 'false'],
+    ['a dry run', 'skip-if-identical', 'true'],
+  ])('does not ask the registry under %s', async (_label, ifExists, dryRun) => {
+    const { statePath, inputs } = await staged(ifExists, dryRun);
+    const { runner, calls } = registry({ status: 0, stdout: 'sha512-AAAA', stderr: '' });
+    publish(statePath, env(inputs), recorder().io, runner);
+    expect(calls.filter((c) => c[2] === 'dist.integrity')).toEqual([]);
+    expect(calls.map((c) => c[0])).toContain('publish');
   });
 });

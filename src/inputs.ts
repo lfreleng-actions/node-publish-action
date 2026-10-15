@@ -33,6 +33,7 @@ export interface RawInputs {
   readonly nexusPassword: string;
   readonly authToken: string;
   readonly oidc: string;
+  readonly ifExists: string;
   readonly vaultMappingJson: string;
   readonly opServiceAccountToken: string;
 }
@@ -54,6 +55,7 @@ export const INPUT_VARIABLES: Readonly<Record<keyof RawInputs, string>> = {
   nexusPassword: 'INPUT_NEXUS_PASSWORD',
   authToken: 'INPUT_AUTH_TOKEN',
   oidc: 'INPUT_OIDC',
+  ifExists: 'INPUT_IF_EXISTS',
   vaultMappingJson: 'INPUT_VAULT_MAPPING_JSON',
   opServiceAccountToken: 'INPUT_OP_SERVICE_ACCOUNT_TOKEN',
 };
@@ -72,6 +74,13 @@ export type Access = '' | 'public' | 'restricted';
 /** How the publish authenticates. 'none' is valid only for a dry run. */
 export type AuthMode = 'basic' | 'token' | 'oidc' | 'none';
 
+/**
+ * What to do when the registry already holds the version: fail, as npm
+ * itself would, or succeed without uploading when its content is
+ * byte-for-byte the archive being published.
+ */
+export type IfExists = 'fail' | 'skip-if-identical';
+
 /** The inputs once checked, in the types later stages consume. */
 export interface CheckedInputs {
   readonly publishVersion: string;
@@ -82,6 +91,7 @@ export interface CheckedInputs {
   readonly tag: string;
   readonly access: Access;
   readonly authMode: AuthMode;
+  readonly ifExists: IfExists;
   /** The path inputs, still unresolved; workspace.ts confines them. */
   readonly pathPrefix: string;
   readonly tarballPath: string;
@@ -248,6 +258,25 @@ function checkNodeVersion(nodeVersion: string, nodeVersionFile: string): void {
   }
 }
 
+/**
+ * Identity is a question about bytes: the registry's integrity against the
+ * archive's. A directory publish has no archive until npm packs it, inside
+ * the publish itself, so skipping needs tarball_path.
+ */
+function checkIfExists(value: string, tarballPath: string): IfExists {
+  if (value !== 'fail' && value !== 'skip-if-identical') {
+    throw new InputError("if_exists must be 'fail' or 'skip-if-identical'");
+  }
+  if (value === 'skip-if-identical' && tarballPath === '') {
+    throw new InputError(
+      "if_exists 'skip-if-identical' needs tarball_path. Whether the " +
+        "registry's copy is identical is a comparison of bytes, and a " +
+        'directory publish has none to compare until npm packs it.',
+    );
+  }
+  return value;
+}
+
 /** Check every text input. Throws {@link InputError} on the first failure. */
 export function checkInputs(raw: RawInputs): InputCheck {
   const dryRun = checkBoolean('dry_run', raw.dryRun);
@@ -270,6 +299,7 @@ export function checkInputs(raw: RawInputs): InputCheck {
         "supports it (public package, public repository). Leave provenance at 'false'",
     );
   }
+  const ifExists = checkIfExists(raw.ifExists, raw.tarballPath);
   checkNodeVersion(raw.nodeVersion, raw.nodeVersionFile);
   return {
     inputs: {
@@ -281,6 +311,7 @@ export function checkInputs(raw: RawInputs): InputCheck {
       tag,
       access,
       authMode: mode,
+      ifExists,
       pathPrefix: raw.pathPrefix,
       tarballPath: raw.tarballPath,
       nodeVersionFile: raw.nodeVersionFile,

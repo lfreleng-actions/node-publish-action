@@ -36,6 +36,7 @@ const BASE: RawInputs = {
   nexusPassword: 'placeholder-not-a-secret',
   authToken: '',
   oidc: 'false',
+  ifExists: 'fail',
   vaultMappingJson: '',
   opServiceAccountToken: '',
 };
@@ -274,6 +275,22 @@ describe('checkInputs: Node.js version', () => {
   it('requires one of the two', () => {
     expect(() => check({ nodeVersion: '', nodeVersionFile: '' })).toThrow('no Node.js version specified');
     expect(() => check({ nodeVersion: '', nodeVersionFile: '.nvmrc' })).not.toThrow();
+  });
+});
+
+describe('checkInputs: if_exists', () => {
+  it.each(['fail', 'skip-if-identical'])('accepts %j with a tarball', (ifExists) => {
+    expect(check({ ifExists, tarballPath: 'pkg.tgz' }).inputs.ifExists).toBe(ifExists);
+  });
+
+  it.each(['', 'skip', 'Skip-If-Identical', 'fail\n'])('rejects %j', (ifExists) => {
+    expect(() => check({ ifExists })).toThrow("if_exists must be 'fail' or 'skip-if-identical'");
+  });
+
+  // Identity is a comparison of bytes; a directory publish has none until
+  // npm packs it.
+  it('requires tarball_path to skip', () => {
+    expect(() => check({ ifExists: 'skip-if-identical' })).toThrow('needs tarball_path');
   });
 });
 

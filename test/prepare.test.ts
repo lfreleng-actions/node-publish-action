@@ -71,6 +71,7 @@ function env(inputs: Record<string, string> = {}): NodeJS.ProcessEnv {
     INPUT_PROVENANCE: 'false',
     INPUT_LOAD_CREDENTIAL: 'false',
     INPUT_OIDC: 'false',
+    INPUT_IF_EXISTS: 'fail',
     ...inputs,
   };
 }

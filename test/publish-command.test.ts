@@ -7,7 +7,12 @@
  * that it produced the right arguments.
  */
 
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+
 import { describe, expect, it } from 'vitest';
+
 
 import {
   definedHooks,
@@ -17,7 +22,9 @@ import {
   VERSION_HOOKS,
   viewArgs,
 } from '../src/publish-command.js';
+import { loadNpmInternals } from '../src/npm-internals.js';
 import type { PublishState } from '../src/state.js';
+import { isolatedEnv } from './support/ground-truth.js';
 
 const REGISTRY = 'https://registry.example.invalid/';
 
@@ -36,6 +43,9 @@ const STATE: PublishState = {
   userconfig: '',
   globalconfig: '',
   idTokenEndpoint: false,
+  packageName: '@onap/ui',
+  ifExists: 'fail',
+  integrity: '',
   registry: REGISTRY,
   scopes: [],
 };
@@ -127,11 +137,66 @@ describe('publishArgs', () => {
 });
 
 describe('viewArgs', () => {
-  it('reads one version back from the resolved registry, every scope pinned', () => {
-    expect(viewArgs('@onap/ui', '1.2.3', { registry: REGISTRY, scopes: ['@onap'] })).toEqual([
-      'view', '@onap/ui@1.2.3', 'version', '--no-json', '--registry', REGISTRY,
-      `--@onap:registry=${REGISTRY}`,
+  const PINNED = { registry: REGISTRY, scopes: ['@onap'], userconfig: '', globalconfig: '' };
+
+  it('reads one field back from the resolved registry, every scope pinned', () => {
+    expect(viewArgs('@onap/ui', '1.2.3', PINNED)).toEqual([
+      'view', '@onap/ui@1.2.3', 'version', '--no-json', '--loglevel=error', '--no-workspaces', '--scope=',
+      '--registry', REGISTRY, `--@onap:registry=${REGISTRY}`,
     ]);
+    expect(viewArgs('@onap/ui', '1.2.3', PINNED, 'dist.integrity')[2]).toBe('dist.integrity');
+  });
+
+  // The same configuration the publish reads: the package's own project,
+  // and the user and global files prepare pinned.
+  it('selects configuration exactly as the publish does', () => {
+    const state = { ...STATE, userconfig: '/u/.npmrc', globalconfig: '/g/npmrc' };
+    const view = viewArgs('p', '1.0.0', state);
+    for (const flag of ['--no-workspaces', '--userconfig=/u/.npmrc', '--globalconfig=/g/npmrc']) {
+      expect(view).toContain(flag);
+      expect(publishArgs(state)).toContain(flag);
+    }
+  });
+
+  // A configured loglevel=silent hides npm's error code, so an absent
+  // version would read as an unanswerable question and block a first
+  // publish. Asked of npm's own configuration, with the read's flags.
+  it("keeps npm's error code visible despite a configured silent log level", async () => {
+    const home = mkdtempSync(path.join(tmpdir(), 'view-loglevel-'));
+    try {
+      const internals = loadNpmInternals();
+      const config = await internals.loadConfig?.({
+        cwd: home,
+        flags: viewArgs('plain', '1.0.0', { ...PINNED, scopes: [] }).slice(3),
+        env: { ...isolatedEnv(home), npm_config_loglevel: 'silent' },
+      });
+      expect(config?.get('loglevel')).toBe('error');
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+
+  // npm view ignores publishConfig, so a configured scope the manifest
+  // masked at publish time would otherwise choose its own registry. Asked
+  // of npm's own configuration and pickRegistry, with the read's flags.
+  it("reads from the resolved registry despite an ambient scope, by npm's own selection", async () => {
+    const home = mkdtempSync(path.join(tmpdir(), 'view-scope-'));
+    try {
+      const internals = loadNpmInternals();
+      const flags = viewArgs('plain', '1.0.0', { ...PINNED, scopes: [] }).slice(3);
+      const config = await internals.loadConfig?.({
+        cwd: home,
+        flags,
+        env: {
+          ...isolatedEnv(home),
+          npm_config_scope: '@ambient',
+          'npm_config_@ambient:registry': 'https://elsewhere.example.invalid/',
+        },
+      });
+      expect(internals.pickRegistry('plain@1.0.0', config?.flat ?? {})).toBe(REGISTRY);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
   });
 });
 

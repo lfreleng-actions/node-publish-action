@@ -72,6 +72,20 @@ function pins(state: Pick<PublishState, 'registry' | 'scopes'>): string[] {
 }
 
 /**
+ * The configuration-selection flags every npm run against the registry
+ * shares, so each reads the configuration the publish reads: the package's
+ * own project (not a workspace root's), and the user and global files
+ * prepare pinned, which a project .npmrc can select and the .npmrc step
+ * replaces.
+ */
+function configFlags(state: Pick<PublishState, 'userconfig' | 'globalconfig'>): string[] {
+  const flags = ['--no-workspaces'];
+  if (state.userconfig !== '') flags.push(`--userconfig=${state.userconfig}`);
+  if (state.globalconfig !== '') flags.push(`--globalconfig=${state.globalconfig}`);
+  return flags;
+}
+
+/**
  * `npm publish`.
  *
  * - A pre-packed tarball is a positional argument, which npm accepts only
@@ -99,9 +113,7 @@ function pins(state: Pick<PublishState, 'registry' | 'scopes'>): string[] {
 export function publishArgs(state: PublishState): string[] {
   const args = ['publish'];
   if (state.tarball !== '') args.push(state.tarball);
-  args.push('--json', '--tag', state.tag, '--no-workspaces');
-  if (state.userconfig !== '') args.push(`--userconfig=${state.userconfig}`);
-  if (state.globalconfig !== '') args.push(`--globalconfig=${state.globalconfig}`);
+  args.push('--json', '--tag', state.tag, ...configFlags(state));
   if (state.access !== '') args.push('--access', state.access);
   if (state.provenanceFile !== '') {
     args.push(`--provenance-file=${state.provenanceFile}`);
@@ -124,15 +136,25 @@ export function publishArgs(state: PublishState): string[] {
 export function viewArgs(
   name: string,
   version: string,
-  state: Pick<PublishState, 'registry' | 'scopes'>,
+  state: Pick<PublishState, 'registry' | 'scopes' | 'userconfig' | 'globalconfig'>,
+  field: 'version' | 'dist.integrity' = 'version',
 ): string[] {
-  // --no-json: a configured json=true would print "1.2.3", quoted, and
-  // a successful publish would then fail verification.
   return [
     'view',
     `${name}@${version}`,
-    'version',
+    field,
+    // A configured json=true would print "1.2.3", quoted, and a successful
+    // publish would then fail verification.
     '--no-json',
+    // A configured loglevel=silent would hide npm's error code, and an
+    // absent version would read as an unanswerable question.
+    '--loglevel=error',
+    ...configFlags(state),
+    // npm view does not load publishConfig, so a configured scope that the
+    // manifest masked at publish time is live again here and could choose
+    // its own registry. Clearing it leaves the package's scope, pinned
+    // below, and --registry: the resolved registry either way.
+    '--scope=',
     '--registry',
     state.registry,
     ...pins(state),

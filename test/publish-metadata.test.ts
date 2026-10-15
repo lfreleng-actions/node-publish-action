@@ -302,6 +302,97 @@ describe('lifecycle script output', () => {
   });
 });
 
+describe('integrity', () => {
+  const INTEGRITY = 'sha512-abc==';
+  const REPORT = JSON.stringify({
+    name: 'pkg',
+    version: '1.0.0',
+    filename: 'pkg-1.0.0.tgz',
+    integrity: INTEGRITY,
+  });
+
+  it("carries npm's reported sha512 integrity", () => {
+    const result = parsePublishOutput(REPORT, { expectedVersion: '1.0.0' });
+    expect(result.ok && result.metadata.integrity).toBe(INTEGRITY);
+  });
+
+  it('ignores an integrity that is not sha512, without rejecting the report', () => {
+    const result = parsePublishOutput(REPORT.replace(INTEGRITY, 'sha1-x='), { expectedVersion: '1.0.0' });
+    expect(result.ok).toBe(true);
+    expect(result.ok && result.metadata.integrity).toBeUndefined();
+  });
+
+  // A hook printing the same report without the field describes the same
+  // publish. Counting it as a second, distinct candidate would make the
+  // parse ambiguous after a successful publish.
+  it('treats a copy without integrity as the same report, keeping the digest', () => {
+    const copy = '{"name":"pkg","version":"1.0.0","filename":"pkg-1.0.0.tgz"}';
+    const result = parsePublishOutput(`${copy}\n${REPORT}\n${copy}`, { expectedVersion: '1.0.0' });
+    expect(result.ok && result.metadata.integrity).toBe(INTEGRITY);
+  });
+
+  // npm 8 to 10 print a flat report. A prepublishOnly running
+  // `npm pack --json` prints another for an earlier archive: same name,
+  // version and filename, different bytes. Which was uploaded cannot be
+  // read, so neither digest may be reported.
+  it('refuses two flat reports with different digests', () => {
+    const earlier = REPORT.replace(INTEGRITY, 'sha512-earlier==');
+    for (const raw of [`${earlier}\n${REPORT}`, `${REPORT}\n${earlier}`]) {
+      expect(parsePublishOutput(raw, { expectedVersion: '1.0.0' })).toEqual({
+        ok: false,
+        failure: { kind: 'conflicting-integrity', name: 'pkg', version: '1.0.0' },
+      });
+    }
+  });
+
+  // A keyed report is npm 11's own shape and already the stronger
+  // evidence; a flat hook copy disagreeing with it does not displace it.
+  it("keeps the keyed report's digest over a disagreeing flat copy", () => {
+    const keyed = `{"pkg":${REPORT}}`;
+    const flat = REPORT.replace(INTEGRITY, 'sha512-hook==');
+    for (const raw of [`${flat}\n${keyed}`, `${keyed}\n${flat}`]) {
+      const result = parsePublishOutput(raw, { expectedVersion: '1.0.0' });
+      expect(result.ok && result.metadata.integrity).toBe(INTEGRITY);
+    }
+  });
+
+  // Digests are settled over every copy, so the answer cannot depend on
+  // the order the copies appeared in. Every ordering of a digest-less
+  // keyed copy, a flat digest and a keyed digest gives the keyed digest.
+  it('settles the digest the same way whatever order the copies arrive in', () => {
+    const bare = '{"pkg":{"name":"pkg","version":"1.0.0","filename":"pkg-1.0.0.tgz"}}';
+    const flat = REPORT.replace(INTEGRITY, 'sha512-hook==');
+    const keyed = `{"pkg":${REPORT}}`;
+    const copies = [bare, flat, keyed];
+    const orders = [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]];
+    for (const order of orders) {
+      const raw = order.map((i) => copies[i]).join('\n');
+      const result = parsePublishOutput(raw, { expectedVersion: '1.0.0' });
+      expect(result.ok && result.metadata.integrity, raw).toBe(INTEGRITY);
+    }
+  });
+
+  it('settles two disagreeing flat copies as a conflict in any order with a bare keyed copy', () => {
+    const bare = '{"pkg":{"name":"pkg","version":"1.0.0","filename":"pkg-1.0.0.tgz"}}';
+    const a = REPORT;
+    const b = REPORT.replace(INTEGRITY, 'sha512-other==');
+    for (const raw of [`${a}\n${b}\n${bare}`, `${bare}\n${a}\n${b}`, `${a}\n${bare}\n${b}`]) {
+      const result = parsePublishOutput(raw, { expectedVersion: '1.0.0' });
+      expect(result.ok ? 'ok' : result.failure.kind, raw).toBe('conflicting-integrity');
+    }
+  });
+
+  // npm 11's keyed report is kept over a flat copy as the stronger
+  // evidence; a digest only the flat copy carried must survive that.
+  it('keeps a digest a flat copy carried when the keyed report is preferred', () => {
+    const keyed = '{"pkg":{"name":"pkg","version":"1.0.0","filename":"pkg-1.0.0.tgz"}}';
+    for (const raw of [`${REPORT}\n${keyed}`, `${keyed}\n${REPORT}`]) {
+      const result = parsePublishOutput(raw, { expectedVersion: '1.0.0' });
+      expect(result.ok && result.metadata.integrity).toBe(INTEGRITY);
+    }
+  });
+});
+
 describe('ambiguity', () => {
   // Normal npm 11 output produces two candidates: the keyed object, and
   // the inner record which reads as the npm 10 flat shape. They normalise

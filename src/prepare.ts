@@ -44,6 +44,7 @@ import {
   provenanceVerdict,
 } from './oidc.js';
 import { definedHooks, PUBLISH_HOOKS } from './publish-command.js';
+import { sha512Integrity } from './integrity.js';
 import { publishFlags } from './publish-options.js';
 import { assertSupportedNpm, resolveEffectiveRegistry, type RegistryResolution } from './registry.js';
 import { makeWorkDir, removeWorkDir, writeState } from './state.js';
@@ -241,6 +242,11 @@ export async function prepare(
       projectDir,
       tarball,
       publishVersion: inputs.publishVersion,
+      packageName,
+      ifExists: inputs.ifExists,
+      // Of the staged copy: the bytes npm will be handed, outside the
+      // checked-out tree.
+      integrity: tarball === '' ? '' : sha512Integrity(tarball),
       dryRun: inputs.dryRun,
       tag: inputs.tag,
       access: inputs.access,

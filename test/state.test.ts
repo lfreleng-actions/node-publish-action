@@ -39,6 +39,9 @@ const STATE: PublishState = {
   userconfig: '',
   globalconfig: '',
   idTokenEndpoint: false,
+  packageName: '@onap/ui',
+  ifExists: 'fail',
+  integrity: '',
   registry: 'https://registry.example.invalid/',
   scopes: ['@a', '@b c'],
 };
