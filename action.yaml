@@ -213,7 +213,7 @@ runs:
     - name: "Create authenticated .npmrc"
       if: inputs.dry_run != 'true' && inputs.oidc != 'true'
       # yamllint disable-line rule:line-length
-      uses: lfreleng-actions/node-create-npmrc-action@e0ff8adfc0591c86d8d07828bffab10f43096155 # v0.2.0
+      uses: lfreleng-actions/node-create-npmrc-action@19f8a252515c4fd850fd0edbdd7ff9ccf7f9f03c # v0.2.1
       with:
         # The resolved registry, not the raw input. This action writes a
         # credential keyed to the registry URL, and it replaces the
