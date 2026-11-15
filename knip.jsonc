@@ -1,0 +1,16 @@
+// SPDX-License-Identifier: Apache-2.0
+// SPDX-FileCopyrightText: 2026 The Linux Foundation
+{
+  "$schema": "https://unpkg.com/knip@6/schema.json",
+  "entry": [
+    "src/bin/publish.ts",
+    "src/bin/prepare.ts",
+    "test/**/*.test.ts",
+    "vitest.config.ts"
+  ],
+  "project": ["src/**/*.ts", "scripts/**/*.mjs", "test/**/*.ts", "*.config.{ts,mjs}"],
+  "ignoreExportsUsedInFile": true,
+  "ignoreBinaries": ["mkfifo", "tsc", "vitest"],
+  "ignoreDependencies": ["@typescript/native", "eslint"],
+  "vitest": false
+}

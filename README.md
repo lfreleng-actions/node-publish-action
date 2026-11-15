@@ -730,6 +730,15 @@ describe. `@typescript/native` aliases TypeScript 7 and provides
 `tsc`; `typescript` aliases `@typescript/typescript6` for ESLint. Keep
 that pairing when upgrading either one.
 
+`knip.jsonc` configures [Knip](https://knip.dev), which the `aislop`
+scan runs to find unused files, exports and dependencies; run it with
+`npx knip`. Knip cannot see the bundle entry points through
+`action.yaml`, so the file names `src/bin/*.ts` and the tests
+directly. The scan runs without `node_modules`, so the file also
+disables the Vitest plugin, which would load `vitest.config.ts`, and
+lists the tools that `package.json` scripts and hooks run. Add
+any new entry point there.
+
 Two different Node.js floors apply, and they are not the same number:
 
 - **The development toolchain** needs the version in `engines`
