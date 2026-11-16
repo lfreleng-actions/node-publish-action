@@ -721,8 +721,8 @@ npm run build   # bundle src/ into dist/ with esbuild
 
 esbuild strips the TypeScript types itself, so bundling stays
 independent of the compiler version; `tsc --noEmit` handles type
-checking. The build output is deterministic, which the `check-dist`
-job depends on.
+checking. The build output is deterministic, which the bundle check
+depends on.
 
 TypeScript 7 ships no compiler API, which typescript-eslint needs, so
 the two versions run side by side as the TypeScript 7 release notes
@@ -753,10 +753,13 @@ Two different Node.js floors apply, and they are not the same number:
 
 The repository **commits** `dist/`. GitHub runs an action straight
 from the repository and offers no build step, so the bundle has to be
-present. The `check-dist` CI job rebuilds it and fails when the result
-differs from what the repository holds, so it cannot drift from
-`src/`. Run `npm run build` and commit the result alongside any source
-change.
+present. The `Bundle / Committed bundle matches sources 📦` CI check,
+from the node-workflows `bundle-check.yaml` reusable workflow, rebuilds
+it and fails when the result differs from what the repository holds,
+which keeps it in step with `src/`. Run `npm run build` and commit the
+result alongside any source change. On a Dependabot pull request the
+same workflow commits the rebuilt bundle to the branch itself, through
+the organisation's GitHub App.
 
 The bundle carries no third-party runtime dependencies.
 `src/actions-io.ts` implements the slice of the Actions runner

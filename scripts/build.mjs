@@ -8,7 +8,7 @@
  * of the compiler version. `tsc --noEmit` remains the type checker; nothing
  * in the build depends on it.
  *
- * Output is deterministic, which the check-dist CI job relies on: it
+ * Output is deterministic, which the Bundle CI check relies on: it
  * rebuilds and fails if the result differs from the committed bundle.
  */
 
