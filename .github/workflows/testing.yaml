@@ -1275,65 +1275,26 @@ jobs:
   # GitHub runs this action straight from the repository, so dist/ has to
   # be committed. That makes it possible for the bundle to drift from src/,
   # and a reviewer reading the diff would see the sources change while the
-  # code that actually runs did not. Rebuild and compare.
-  check-dist:
-    name: "Test: committed bundle matches sources"
-    runs-on: ubuntu-latest
+  # code that actually runs did not. The reusable workflow rebuilds and
+  # compares, and on a Dependabot pull request commits the rebuilt bundle
+  # through the organisation's GitHub App. One 'npm run build' writes both
+  # dist/prepare and dist/publish, so one call covers both. The check
+  # reports as 'Bundle / Committed bundle matches sources 📦'.
+  bundle:
+    name: "Bundle"
     permissions:
       contents: read
-    timeout-minutes: 10
-    steps:
-      # Load the egress allow-list out-of-band from the
-      # organisation's .github repository and publish it as
-      # $CONNECTION_ALLOW_LIST for the harden-runner step below.
-      # yamllint disable-line rule:line-length
-      - uses: lfreleng-actions/harden-runner-block-action@bd83615a22b57835798adcb9ce753161464dfb40  # v0.16.2
-        with:
-          config: '@6d4a65c5601afd6c2fbe52bda4b0024b132f265d' # v0.19.0
-
-      # Harden the runner with the just-loaded allow-list.
-      - name: "Harden runner (block)"
-        # yamllint disable-line rule:line-length
-        uses: step-security/harden-runner@46b06cea07f9e64621fdf066ba77ac6915163d43  # v2.22.3
-        with:
-          egress-policy: 'block'
-          allowed-endpoints: >
-            ${{ env.CONNECTION_ALLOW_LIST }}
-
-      - name: "Checkout repository"
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: "Setup Node.js"
-        # yamllint disable-line rule:line-length
-        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
-        with:
-          node-version: '24'
-          cache: 'npm'
-
-      - name: "Rebuild and compare against the committed bundle"
-        shell: bash
-        run: |
-          # Rebuild and compare against the committed bundle
-          npm ci --no-audit --no-fund
-          npm run build
-          # git diff sees modified tracked files only, so a build that
-          # emits a *new* artefact nobody committed would slip through.
-          # --porcelain with --untracked-files=all reports additions,
-          # modifications and deletions alike.
-          drift="$(git status --porcelain --untracked-files=all -- dist/)"
-          if [ -n "${drift}" ]; then
-            echo "The committed bundle differs from a fresh build ❌"
-            printf '%s\n' "${drift}"
-            echo "Run 'npm run build' and commit the result."
-            echo "Committed bundle is stale ❌" \
-              >> "$GITHUB_STEP_SUMMARY"
-            exit 1
-          fi
-          echo "Committed bundle matches the sources ✅"
-          echo "Committed bundle matches the sources ✅" \
-            >> "$GITHUB_STEP_SUMMARY"
+    # yamllint disable-line rule:line-length
+    uses: lfreleng-actions/node-workflows/.github/workflows/bundle-check.yaml@90d2041833a109f7da3af4c154472cf0f025b0bf  # v0.15.0
+    with:
+      node_version: '24'
+      build_script: build
+      bundle_path: dist
+      # The App's client ID is not a secret
+      app_client_id: ${{ vars.LF_RELENG_BOT_CLIENT_ID }}
+    secrets:
+      # Dependabot-triggered runs read this from Dependabot secrets
+      APP_PRIVATE_KEY: ${{ secrets.LF_RELENG_BOT_PRIVATE_KEY }}
 
   ### Test that lifecycle output cannot corrupt the parsed metadata ###
   # npm runs lifecycle scripts with inherited stdio, so their output lands
