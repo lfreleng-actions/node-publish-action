@@ -171,9 +171,11 @@ jobs:
             ${{ env.CONNECTION_ALLOW_LIST }}
 
       # A minimal project isolates each negative test on its target
-      # input; the placeholder password below is a test literal, not
-      # a real credential
+      # input. The password the registry URL case needs is random,
+      # generated here and masked, so no credential-shaped literal
+      # sits in the repository.
       - name: "Create minimal project fixture"
+        id: fixture
         shell: bash
         run: |
           # Create minimal project fixture
@@ -181,6 +183,9 @@ jobs:
           printf '%s\n' \
             '{"name": "fake-project", "version": "1.0.0"}' \
             > fake-project/package.json
+          generated_pw="$(openssl rand -hex 16)"
+          echo "::add-mask::${generated_pw}"
+          echo "nexus_password=${generated_pw}" >> "$GITHUB_OUTPUT"
 
       - name: "Running local action with shell metacharacters"
         id: bad-version
@@ -210,7 +215,7 @@ jobs:
           path_prefix: fake-project
           publish_version: '1.0.0'
           registry_url: 'https://nexus3.example.org/repository/npm'
-          nexus_password: 'placeholder-not-a-secret'
+          nexus_password: ${{ steps.fixture.outputs.nexus_password }}
 
       - name: "Running local action without credentials"
         id: no-credentials
@@ -640,9 +645,22 @@ jobs:
           persist-credentials: false
 
       - name: "Create minimal project fixtures"
+        id: fixtures
         shell: bash
         run: |
           # Create minimal project fixtures
+          # Generate the test credentials at run time and mask them,
+          # so no credential-shaped literal sits in the repository.
+          # The token keeps npm's 'npm_' prefix so it looks like the
+          # tokens callers pass; only its random suffix is secret.
+          generated_tok="npm_$(openssl rand -hex 16)"
+          generated_pw="$(openssl rand -hex 16)"
+          echo "::add-mask::${generated_tok}"
+          echo "::add-mask::${generated_pw}"
+          {
+            echo "auth_token=${generated_tok}"
+            echo "nexus_password=${generated_pw}"
+          } >> "$GITHUB_OUTPUT"
           mkdir -p auth-project
           # The package name reaches npm during the dry runs below,
           # which query the registry for an existing version. An
@@ -671,7 +689,7 @@ jobs:
           jq -e . oidc-project/package.json > /dev/null
 
       # Ambiguous credentials must fail rather than silently pick one.
-      # The token below is a test literal, not a real credential.
+      # The credentials below are the random ones generated above.
       #
       # These conflict cases run in dry-run mode, so the validation
       # branch under test is the only thing standing between the
@@ -686,8 +704,8 @@ jobs:
           path_prefix: auth-project
           publish_version: '1.0.0'
           registry_url: 'https://registry.npmjs.org/'
-          auth_token: 'npm_testTOKEN0123456789abcdefGHIJKLM'
-          nexus_password: 'testpass'
+          auth_token: ${{ steps.fixtures.outputs.auth_token }}
+          nexus_password: ${{ steps.fixtures.outputs.nexus_password }}
           dry_run: 'true'
 
       # Basic auth has two routes into the mode counter, and only one
@@ -707,7 +725,7 @@ jobs:
           path_prefix: auth-project
           publish_version: '1.0.0'
           registry_url: 'https://registry.npmjs.org/'
-          auth_token: 'npm_testTOKEN0123456789abcdefGHIJKLM'
+          auth_token: ${{ steps.fixtures.outputs.auth_token }}
           load_credential: 'true'
           dry_run: 'true'
 
@@ -726,7 +744,7 @@ jobs:
           registry_url: 'https://registry.npmjs.org/'
           node_version: '24'
           oidc: 'true'
-          auth_token: 'npm_testTOKEN0123456789abcdefGHIJKLM'
+          auth_token: ${{ steps.fixtures.outputs.auth_token }}
           dry_run: 'true'
 
       - name: "OIDC plus password [expected failure]"
@@ -739,7 +757,7 @@ jobs:
           registry_url: 'https://registry.npmjs.org/'
           node_version: '24'
           oidc: 'true'
-          nexus_password: 'testpass'
+          nexus_password: ${{ steps.fixtures.outputs.nexus_password }}
           dry_run: 'true'
 
       - name: "OIDC plus load_credential [expected failure]"
@@ -805,7 +823,7 @@ jobs:
           path_prefix: token-project
           publish_version: '1.0.0'
           registry_url: 'https://registry.example.invalid/'
-          auth_token: 'npm_testTOKEN0123456789abcdefGHIJKLM'
+          auth_token: ${{ steps.fixtures.outputs.auth_token }}
           # nexus_user carries no secret and selects no mode, so it
           # must not conflict with token auth -- callers computing it
           # unconditionally across a Nexus/npmjs matrix depend on
@@ -814,6 +832,8 @@ jobs:
 
       - name: "Verify the token reached the .npmrc"
         shell: bash
+        env:
+          AUTH_TOKEN: ${{ steps.fixtures.outputs.auth_token }}
         run: |
           # Verify the token reached the .npmrc
           errors=0
@@ -822,11 +842,15 @@ jobs:
           # still pass if the forwarding picked up the wrong input --
           # nexus_user is deliberately non-empty in this case, so a
           # mix-up would produce a plausible-looking entry. grep -qxF
-          # keeps the value out of the log: the token is a test
-          # literal, but printing credential material in CI output is
+          # keeps the value out of the log: the token is masked and
+          # random, but printing credential material in CI output is
           # a bad habit to encode in a test.
+          if [ -z "${AUTH_TOKEN}" ]; then
+            echo "No generated token reached this step ❌"
+            exit 1
+          fi
           want='//registry.example.invalid/:_authToken='
-          want="${want}npm_testTOKEN0123456789abcdefGHIJKLM"
+          want="${want}${AUTH_TOKEN}"
           if [ ! -f token-project/.npmrc ]; then
             echo "Token auth wrote no .npmrc ❌"
             errors=1
